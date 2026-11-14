@@ -1,0 +1,66 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PE Prep — Meta Production Engineering Interview</title><link rel="stylesheet" href="styles.css"></head><body>
+<div class="layout" style="grid-template-columns:1fr;max-width:1100px">
+<main>
+<section class="hero">
+<h1>Master System Design, OS, Linux & Networking<br>for the Meta Production Engineering interview</h1>
+<p class="lead">A from-scratch, beginner-friendly curriculum that goes all the way to deep dives. Every concept has a diagram, many have live simulators, and each section ends with interview-style questions. Progress is saved in your browser.</p>
+<div class="controls"><a class="btn" href="system-design.html">Start with System Design →</a><a class="btn ghost" href="interview.html">Jump to Interview Kit</a></div>
+</section>
+
+<div class="callout pe"><b>What a Production Engineer interview actually tests</b>
+Meta PE ≈ SRE + software engineer. The "live technical" is typically a <b>broad, conversational</b> probe: they poke a topic (e.g. "what happens when you type a URL?", "a server has high load, what do you do?", "design a system to collect metrics from 1M hosts"), then keep asking <i>"why?"</i> and <i>"what if that fails?"</i> until you reach your limit. Breadth across <b>systems, Linux internals, networking, and distributed system design</b> matters more than any single framework. Expect to reason about <b>failure modes, capacity, monitoring and debugging</b> constantly. This site is built around that.</div>
+
+<h2>Roadmap</h2>
+<div class="grid toc-cards">
+<a class="card" href="system-design.html"><h3>1. System Design <span class="badge basic">start here</span></h3><p>Client-server → scaling → load balancing → caching → databases → replication & sharding → consistency & CAP → consensus → queues → resilience patterns → observability & SRE. 20+ animated diagrams, 11 simulators.</p><span class="tag">~5–7 hours</span></a>
+<a class="card" href="case-studies.html"><h3>2. Case Studies</h3><p>Full walkthroughs: URL shortener, rate limiter, metrics/monitoring system, log pipeline, news feed, chat, notification service, web crawler, distributed cache, file storage, config distribution, job scheduler.</p><span class="tag">~4 hours</span></a>
+<a class="card" href="os.html"><h3>3. Operating Systems</h3><p>Processes & threads, virtual memory & paging, scheduling, syscalls, file descriptors, signals, fork/exec, IPC, I/O models (epoll), deadlocks, boot process, OOM killer.</p><span class="tag">~3 hours</span></a>
+<a class="card" href="linux.html"><h3>4. Linux & Troubleshooting <span class="badge pe">PE core</span></h3><p>The debugging toolbox (top, vmstat, iostat, strace, lsof, ss, tcpdump, perf), /proc, load average, filesystems & inodes, systemd, and 10 realistic incident scenarios walked end-to-end.</p><span class="tag">~3 hours</span></a>
+<a class="card" href="networking.html"><h3>5. Networking</h3><p>OSI/TCP-IP, TCP handshake & congestion (animated), UDP, IP/CIDR (calculator), ARP, DNS, HTTP/1.1/2/3, TLS, NAT, routing & BGP, load balancers, "what happens when you type a URL" at every layer.</p><span class="tag">~3 hours</span></a>
+<a class="card" href="interview.html"><h3>6. Interview Kit</h3><p>The 5-step design framework, 200+ rapid-fire Q&A, flashcards, numbers to memorize, cheat sheets, mock prompts, and a final readiness checklist.</p><span class="tag">review daily</span></a>
+</div>
+
+<h2>How to study with this site</h2>
+<div class="steps">
+<div class="step"><b>Read the Basics pass first.</b> Every section is tagged <span class="badge basic">basics</span> or <span class="badge deep">deep dive</span>. Do all basics across all pages before any deep dives — PE interviews reward breadth.</div>
+<div class="step"><b>Play with every simulator</b> until you can predict what will happen before you click. If you can predict it, you understand it.</div>
+<div class="step"><b>Say answers out loud.</b> Quizzes have hidden answers. Speak your answer before revealing — the interview is verbal.</div>
+<div class="step"><b>Draw.</b> After each case study, redraw the architecture from memory on paper in under 5 minutes.</div>
+<div class="step"><b>Mark sections done</b> (○ in the sidebar) to track coverage. Finish with the Interview Kit checklist.</div>
+</div>
+
+<h2>The mental model that ties everything together</h2>
+<div class="diagram"><svg viewBox="0 0 900 330" width="900">
+<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#5b8cff"/></marker></defs>
+<rect class="box" x="20" y="130" width="100" height="60"/><text class="svg-text" x="70" y="165" text-anchor="middle">Client</text>
+<rect class="box" x="170" y="130" width="90" height="60"/><text class="svg-text" x="215" y="157" text-anchor="middle">DNS /</text><text class="svg-text" x="215" y="172" text-anchor="middle">CDN</text>
+<rect class="box hl" x="310" y="130" width="100" height="60"/><text class="svg-text" x="360" y="165" text-anchor="middle">Load Balancer</text>
+<rect class="box" x="460" y="60" width="110" height="50"/><text class="svg-text" x="515" y="90" text-anchor="middle">App server</text>
+<rect class="box" x="460" y="140" width="110" height="50"/><text class="svg-text" x="515" y="170" text-anchor="middle">App server</text>
+<rect class="box" x="460" y="220" width="110" height="50"/><text class="svg-text" x="515" y="250" text-anchor="middle">App server</text>
+<rect class="box cache" x="630" y="40" width="100" height="50"/><text class="svg-text" x="680" y="70" text-anchor="middle">Cache</text>
+<rect class="box db" x="630" y="130" width="100" height="50"/><text class="svg-text" x="680" y="160" text-anchor="middle">Primary DB</text>
+<rect class="box db" x="770" y="130" width="100" height="50"/><text class="svg-text" x="820" y="160" text-anchor="middle">Replica</text>
+<rect class="box q" x="630" y="230" width="100" height="50"/><text class="svg-text" x="680" y="260" text-anchor="middle">Queue</text>
+<rect class="box" x="770" y="230" width="100" height="50"/><text class="svg-text" x="820" y="260" text-anchor="middle">Workers</text>
+<path class="wire anim" d="M120 160 H170"/><path class="wire anim" d="M260 160 H310"/>
+<path class="wire anim" d="M410 160 L460 85"/><path class="wire anim" d="M410 160 H460"/><path class="wire anim" d="M410 160 L460 245"/>
+<path class="wire" d="M570 85 L630 65" marker-end="url(#ar)"/><path class="wire" d="M570 165 H630" marker-end="url(#ar)"/><path class="wire" d="M570 245 L630 255" marker-end="url(#ar)"/>
+<path class="wire anim" d="M730 155 H770"/><path class="wire anim" d="M730 255 H770"/>
+<circle class="packet" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M120 160 H310 L460 85 L570 85 L630 65"/></circle>
+<circle class="packet g" r="5"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M120 160 H310 H460 H570 H630"/></circle>
+<circle class="packet y" r="5"><animateMotion dur="3s" begin="2s" repeatCount="indefinite" path="M120 160 H310 L460 245 L630 255 L870 255"/></circle>
+<text class="svg-mono" x="20" y="310">Every "big" system is this picture, repeated and specialized. Each box = a chapter. Each wire = a failure mode to discuss.</text>
+</svg></div>
+
+<h2>Numbers you must be able to recite</h2>
+<div class="grid">
+<div class="card"><h4>Time</h4><div class="kv"><b>1 day</b><span>86,400 s ≈ 10⁵ s</span><b>1 month</b><span>≈ 2.5M s</span><b>1 year</b><span>≈ 31.5M s ≈ π×10⁷ s</span></div></div>
+<div class="card"><h4>Powers of 2</h4><div class="kv"><b>2¹⁰</b><span>1 thousand (KB)</span><b>2²⁰</b><span>1 million (MB)</span><b>2³⁰</b><span>1 billion (GB)</span><b>2⁴⁰</b><span>1 trillion (TB)</span></div></div>
+<div class="card"><h4>Sizes</h4><div class="kv"><b>char</b><span>1 B (ASCII) / up to 4 B (UTF-8)</span><b>int/long</b><span>4 / 8 B</span><b>UUID</b><span>16 B</span><b>tweet</b><span>~300 B</span><b>photo</b><span>~300 KB–3 MB</span></div></div>
+<div class="card"><h4>Rough capacities</h4><div class="kv"><b>1 web server</b><span>1k–10k simple RPS</span><b>MySQL node</b><span>~1k–10k QPS (writes lower)</span><b>Redis node</b><span>~100k ops/s</span><b>Kafka broker</b><span>~1M msg/s</span><b>1 Gbps NIC</b><span>~125 MB/s</span></div></div>
+</div>
+<div class="bars" data-sim="latency" style="margin-top:20px"></div>
+
+</main></div>
+<script src="app.js"></script></body></html>

@@ -1,0 +1,595 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>System Design — PE Prep</title><link rel="stylesheet" href="styles.css"></head><body>
+<div class="layout"><aside class="sidebar"></aside>
+<main>
+<section class="hero"><h1>System Design, from zero to deep</h1>
+<p class="lead">Read top to bottom. Each chapter starts with the <span class="badge basic">basics</span> and escalates into <span class="badge deep">deep dives</span>. Orange <span class="badge pe">PE angle</span> boxes tell you what a Production Engineering interviewer specifically cares about.</p></section>
+
+<!-- ============================================================ -->
+<h2>What system design actually is</h2>
+<p>System design is the art of <b>combining a handful of well-understood building blocks</b> (servers, load balancers, caches, databases, queues) so that a product <b>works correctly, stays fast, stays up, and stays affordable</b> as it grows from 10 users to 1 billion. There are no new blocks to invent in an interview. There are only trade-offs to reason about.</p>
+<div class="grid">
+<div class="card"><h4>Scalability</h4>Handle more load by adding resources, ideally linearly. "If I double the machines, do I double the throughput?"</div>
+<div class="card"><h4>Availability</h4>Fraction of time the system answers correctly. Measured in "nines". 99.9% = ~8.7 h down/year.</div>
+<div class="card"><h4>Reliability</h4>Does it do the right thing, every time, even when parts fail? Includes durability (not losing data).</div>
+<div class="card"><h4>Latency vs Throughput</h4>Latency = time for one request (p50, p99). Throughput = requests per second. They are different; optimizing one can hurt the other (batching ↑ throughput, ↑ latency).</div>
+<div class="card"><h4>Consistency</h4>Do all readers see the same data at the same time? Strong vs eventual; the central distributed-systems trade-off.</div>
+<div class="card"><h4>Maintainability / Operability</h4>Can humans run it? Observability, simplicity, deployability. PEs live here.</div>
+</div>
+<div class="callout pe"><b>PE angle</b>Software engineers are asked "design Instagram". PEs are more often asked "design the <i>infrastructure</i> for X" — e.g., a metrics pipeline, a config distribution system, a deployment system, a log aggregator — and then grilled on: <b>what breaks, how you'd know, how you'd debug it, how you'd scale it 10×</b>. Always volunteer failure modes and monitoring without being asked.</div>
+
+<h3>The one skill: the "why / what if" ladder</h3>
+<p>Interviewers climb a ladder: <i>"Why a cache here?" → "What if the cache dies?" → "What if it comes back empty?" → "What if a single key gets 1M QPS?"</i> You win by having a trade-off answer at every rung. Every section below is organized to give you those rungs.</p>
+
+<!-- ============================================================ -->
+<h2>Foundations: how a request travels <span class="badge basic">basics</span></h2>
+<p>Everything starts with <b>client–server</b>: a client (browser, phone app, another service) sends a <b>request</b> over a network to a <b>server</b>, which returns a <b>response</b>.</p>
+<div class="diagram"><svg viewBox="0 0 900 230" width="900">
+<rect class="box" x="20" y="80" width="110" height="60"/><text class="svg-text" x="75" y="115" text-anchor="middle">Browser</text>
+<rect class="box" x="230" y="20" width="110" height="50"/><text class="svg-text" x="285" y="50" text-anchor="middle">DNS resolver</text>
+<rect class="box hl" x="430" y="80" width="140" height="60"/><text class="svg-text" x="500" y="108" text-anchor="middle">Web server</text><text class="svg-mono" x="500" y="125" text-anchor="middle">93.184.216.34:443</text>
+<rect class="box db" x="700" y="80" width="140" height="60"/><text class="svg-text" x="770" y="115" text-anchor="middle">Database</text>
+<path class="wire" d="M130 100 L230 50"/><text class="svg-mono" x="150" y="60">1. "IP of example.com?"</text>
+<path class="wire" d="M230 60 L130 110"/><text class="svg-mono" x="130" y="150">2. "93.184.216.34"</text>
+<path class="wire" d="M130 120 H430"/><text class="svg-mono" x="240" y="140">3. TCP handshake + TLS</text><text class="svg-mono" x="240" y="155">4. GET /feed HTTP/1.1</text>
+<path class="wire" d="M570 110 H700"/><text class="svg-mono" x="585" y="100">5. SELECT ...</text>
+<circle class="packet" r="5"><animateMotion dur="4s" repeatCount="indefinite" path="M130 100 L230 50 L130 110 H430 H700 H430 H130"/></circle>
+<text class="svg-mono" x="20" y="210">6. 200 OK + HTML/JSON travels back. Total time = DNS + TCP (1 RTT) + TLS (1–2 RTT) + server time + transfer.</text>
+</svg></div>
+
+<h3>Vocabulary you need</h3>
+<table><tr><th>Term</th><th>Meaning</th><th>Interview one-liner</th></tr>
+<tr><td>DNS</td><td>Maps names → IPs. Hierarchical, cached with TTLs.</td><td>"Phone book of the internet; also our first load-balancing lever (round-robin / GeoDNS)."</td></tr>
+<tr><td>IP</td><td>Addressing + routing packets between hosts. Best-effort, no ordering.</td><td>"Postal address. Packets may be lost, duplicated, reordered."</td></tr>
+<tr><td>TCP</td><td>Reliable, ordered byte stream over IP. Connection-oriented (handshake), flow & congestion control.</td><td>"Reliable pipe. Costs an RTT to set up; head-of-line blocking."</td></tr>
+<tr><td>UDP</td><td>Unreliable datagrams. No handshake, no ordering.</td><td>"Fire-and-forget. For DNS, video, games, QUIC."</td></tr>
+<tr><td>TLS</td><td>Encryption + authentication on top of TCP (HTTPS).</td><td>"Certificates prove identity; handshake costs 1–2 RTTs; terminate at the LB."</td></tr>
+<tr><td>HTTP</td><td>Request/response application protocol. Methods (GET/POST…), status codes, headers. Stateless.</td><td>"Stateless text protocol; HTTP/2 multiplexes; HTTP/3 runs over QUIC/UDP."</td></tr>
+<tr><td>RTT</td><td>Round-trip time. Same DC ≈ 0.5 ms; cross-country ≈ 60–80 ms; cross-ocean ≈ 150 ms.</td><td>"Every sequential round trip is a latency tax — minimize them."</td></tr>
+</table>
+
+<h3>API styles</h3>
+<div class="tabs">
+<div class="tab" data-title="REST"><p>Resources as URLs, HTTP verbs as actions, JSON bodies. <code>GET /users/42</code>, <code>POST /users</code>, <code>DELETE /users/42</code>. Stateless, cacheable (GET), human-readable, universally supported.</p><p><b>Good for:</b> public APIs, CRUD. <b>Weak at:</b> over/under-fetching, strict typing, high-performance internal calls.</p>
+<pre><code>GET /api/v1/users/42?fields=name,email HTTP/1.1
+Host: api.example.com
+Authorization: Bearer eyJ...
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: max-age=60
+ETag: "a3f9"
+
+{"id":42,"name":"Ada","email":"ada@example.com"}</code></pre>
+<p><b>Status codes to know:</b> 200 OK, 201 Created, 204 No Content, 301/302 redirects, 304 Not Modified, 400 Bad Request, 401 Unauthenticated, 403 Forbidden, 404, 409 Conflict, 429 Too Many Requests, 500, 502 Bad Gateway (upstream dead), 503 Unavailable (overloaded), 504 Gateway Timeout.</p></div>
+<div class="tab" data-title="gRPC / RPC"><p>Call a remote function like a local one. gRPC = Protocol Buffers (binary, schema'd, compact) over HTTP/2 (multiplexed, streaming). 5–10× smaller payloads and far cheaper parsing than JSON. Code-generated clients in every language. Supports bidirectional streaming.</p><p><b>Good for:</b> internal service-to-service calls (this is what Meta uses internally, via Thrift). <b>Weak at:</b> browsers (needs grpc-web), human debugging.</p>
+<pre><code>service UserService {
+  rpc GetUser (GetUserRequest) returns (User);
+  rpc StreamEvents (Empty) returns (stream Event);
+}
+message User { int64 id = 1; string name = 2; string email = 3; }</code></pre></div>
+<div class="tab" data-title="GraphQL"><p>Client specifies exactly the fields it wants in one query; server resolves a graph. Solves over/under-fetching for mobile. Invented at Facebook. <b>Downsides:</b> caching is harder (everything is POST to one endpoint), expensive queries can be abused (need depth/complexity limits), N+1 problem on the server (use DataLoader batching).</p></div>
+<div class="tab" data-title="WebSockets / SSE / Long polling"><p>For server → client push (chat, notifications, live dashboards):</p><ul><li><b>Short polling:</b> client asks every N seconds. Simple, wasteful, latency = N.</li><li><b>Long polling:</b> server holds the request open until data exists or timeout. Near-realtime, works everywhere, but a held connection per client.</li><li><b>Server-Sent Events:</b> one-way HTTP stream from server. Simple, auto-reconnect, text only.</li><li><b>WebSockets:</b> full-duplex persistent TCP connection after an HTTP upgrade. Best for chat/games. Cost: stateful connections — LB must support them, and a server with 1M connections holds 1M sockets (memory, file descriptors!).</li></ul></div>
+</div>
+
+<h3>Stateless vs stateful services — the most important design choice</h3>
+<div class="compare">
+<div class="card"><h4>Stateless <span class="badge basic">prefer</span></h4><p>Server keeps nothing between requests; all state lives in a DB/cache. Any server can handle any request → trivial horizontal scaling, trivial failover, safe to kill & redeploy. Session data → cookie/JWT or Redis.</p></div>
+<div class="card"><h4>Stateful</h4><p>Server holds client state (sessions, WebSocket connections, in-memory shard). Needs sticky routing, careful failover, and data migration on scale-out. Sometimes unavoidable (databases, caches, WebSocket gateways) — isolate it into a dedicated tier.</p></div>
+</div>
+<div class="callout"><b>Rule</b>Push state to the edges (client) or the bottom (storage tier). Keep the middle (application tier) stateless. Nearly every scaling trick depends on this.</div>
+
+<!-- ============================================================ -->
+<h2>Back-of-the-envelope estimation <span class="badge basic">basics</span></h2>
+<p>Interviewers want to see you size the problem before designing. The goal is <b>order of magnitude</b>, not precision. Round aggressively.</p>
+<div class="steps">
+<div class="step"><b>Users → requests.</b> DAU × actions per user per day = requests/day. Divide by 10⁵ (≈86,400) to get QPS. Peak ≈ 2–5× average.</div>
+<div class="step"><b>Read/write ratio.</b> Most systems are read-heavy (10:1 to 100:1). Writes drive storage & DB design; reads drive caching.</div>
+<div class="step"><b>Storage.</b> Writes/day × object size × days retained × replication factor (usually 3).</div>
+<div class="step"><b>Bandwidth.</b> QPS × payload size. Compare to NIC (1 Gbps ≈ 125 MB/s; 10 Gbps ≈ 1.25 GB/s).</div>
+<div class="step"><b>Memory for cache.</b> 80/20 rule: cache 20% of daily read volume to serve ~80% of reads.</div>
+<div class="step"><b>Machines.</b> Peak QPS ÷ per-machine capacity (+ headroom, + N+1 redundancy, + one failure domain).</div>
+</div>
+<div class="sim" data-sim="est"><h4 style="margin-top:0">Interactive estimator</h4>
+<div class="controls">
+<label>Daily active users<input class="dau" type="number" value="100000000"></label>
+<label>Requests / user / day<input class="rpu" type="number" value="20"></label>
+<label>Read:write ratio (reads per write)<input class="rw" type="number" value="10"></label>
+<label>Avg object size (bytes)<input class="size" type="number" value="500"></label>
+<label>Years retained<input class="yrs" type="number" value="5"></label>
+<label>Replication factor<input class="rep" type="number" value="3"></label>
+<label>QPS per server<input class="cap" type="number" value="5000"></label>
+</div><div class="out"></div></div>
+<div class="callout good"><b>Say it like this</b>"100M DAU × 20 requests ≈ 2B requests/day ≈ 20k QPS average, call it 60k peak. 10:1 reads so ~6k writes/s. 500 B per write → ~250 GB/day new data → ~450 TB over 5 years with 3× replication. That won't fit on one box → we need sharding. 60k reads/s → a few dozen app servers behind an LB, and a cache tier because most reads are repeated."</div>
+
+<!-- ============================================================ -->
+<h2>Scaling: vertical, horizontal, and load balancing <span class="badge basic">basics</span></h2>
+<div class="compare">
+<div class="card"><h4>Vertical scaling (scale up)</h4><p>Bigger machine: more CPU, RAM, faster disks. <b>Pros:</b> zero code changes, no distributed-systems problems. <b>Cons:</b> hard ceiling, exponentially pricier, single point of failure, downtime to upgrade. Always the first step; never the last.</p></div>
+<div class="card"><h4>Horizontal scaling (scale out)</h4><p>More machines, commodity hardware. <b>Pros:</b> near-unlimited, fault-tolerant (one dies, others continue), cheap. <b>Cons:</b> requires statelessness or partitioning, introduces network failures, consistency problems, operational complexity. This is what the rest of this page is about.</p></div>
+</div>
+
+<h3>Load balancers</h3>
+<p>A load balancer (LB) sits in front of a pool of identical servers, spreading requests and hiding failures. It is <b>the component that makes horizontal scaling possible</b>.</p>
+<div class="sim" data-sim="lb"><h4 style="margin-top:0">Load balancing simulator</h4>
+<div class="controls"><label>Algorithm<select><option value="rr">Round robin</option><option value="wrr">Weighted round robin</option><option value="lc">Least connections</option><option value="hash">IP hash (sticky)</option><option value="rand">Random</option></select></label>
+<button class="btn sm ghost kill">Kill S1</button><button class="btn sm ghost kill">Kill S2</button><button class="btn sm ghost kill">Kill S3</button></div>
+<canvas width="760" height="250"></canvas>
+<p class="tag">Kill a server: health checks remove it from rotation and traffic flows to survivors. With IP hash, note which clients move. Try weighted RR with S1 w=3.</p></div>
+
+<h4>Algorithms</h4>
+<table><tr><th>Algorithm</th><th>How</th><th>When</th></tr>
+<tr><td>Round robin</td><td>Rotate through servers</td><td>Homogeneous servers, uniform requests</td></tr>
+<tr><td>Weighted RR</td><td>Bigger servers get proportionally more</td><td>Mixed hardware; canary (send 1% to new version)</td></tr>
+<tr><td>Least connections / least load</td><td>Pick server with fewest in-flight requests</td><td>Requests vary widely in cost (long-tail). Default for L7 LBs</td></tr>
+<tr><td>Least response time</td><td>Fastest responding server</td><td>Latency-sensitive, heterogeneous backends</td></tr>
+<tr><td>IP / consistent hash</td><td>Same client (or key) → same server</td><td>Sticky sessions, per-key caches. Beware hot keys</td></tr>
+<tr><td>Power of two choices</td><td>Pick 2 random, choose less loaded</td><td>Massively parallel LBs where global least-conn state is impossible. Surprisingly near-optimal</td></tr></table>
+
+<h4>Layer 4 vs Layer 7 <span class="badge deep">deep dive</span></h4>
+<div class="compare">
+<div class="card"><h4>L4 (transport)</h4><p>Looks only at IP + TCP/UDP port. Forwards packets (NAT or Direct Server Return). Extremely fast (millions of connections), protocol-agnostic, cheap. Cannot route by URL or inspect content. Examples: Linux IPVS, AWS NLB, Maglev, Katran (Meta's XDP-based L4 LB).</p></div>
+<div class="card"><h4>L7 (application)</h4><p>Terminates TCP+TLS, parses HTTP. Routes by path/host/header/cookie, does TLS offload, compression, auth, rate-limiting, retries, WebSocket upgrade, observability. Slower & more CPU, but smart. Examples: Nginx, HAProxy, Envoy, AWS ALB, Proxygen (Meta).</p></div>
+</div>
+<p><b>Typical production stack:</b> DNS/anycast → L4 LB tier (stateless, ECMP from routers, consistent hashing of connections) → L7 proxy tier → services. The L4 tier makes the L7 tier horizontally scalable; the L7 tier makes services smart.</p>
+
+<h4>Health checks & failure handling</h4>
+<ul><li><b>Active:</b> LB probes <code>/health</code> every N seconds; mark unhealthy after K failures, healthy after M successes (hysteresis prevents flapping).</li><li><b>Passive:</b> watch real traffic; eject on 5xx/timeouts (outlier detection).</li><li><b>Shallow vs deep health checks:</b> "process is up" vs "I can reach my DB". Deep checks can cause cascading removal when a shared dependency hiccups — a classic outage. Prefer shallow for LB, deep for alerting.</li><li><b>Connection draining:</b> on deploy, stop sending new requests but let in-flight ones finish.</li></ul>
+<div class="callout warn"><b>Who balances the load balancer?</b>LBs come in pairs (active-passive with a floating VIP via VRRP/keepalived) or as a stateless horizontally-scaled tier using ECMP + consistent hashing (Maglev/Katran). DNS or anycast spreads traffic across LB clusters and regions.</div>
+
+<h3>Global traffic: DNS, GeoDNS, anycast, CDN edge</h3>
+<ul><li><b>DNS round robin:</b> return multiple A records; crude, clients cache, no health awareness.</li><li><b>GeoDNS:</b> resolver location → nearest datacenter's IP. Latency-based routing. TTL (60 s) bounds failover time.</li><li><b>Anycast:</b> same IP announced from many PoPs via BGP; the internet routes to the nearest. Instant failover, DDoS absorption. Used for DNS roots, CDNs, Meta's edge.</li><li><b>Edge PoPs:</b> terminate TLS close to the user (short RTT for handshake), keep warm long-lived connections back to the datacenter. Huge latency win.</li></ul>
+
+<!-- ============================================================ -->
+<h2>Caching <span class="badge basic">basics</span></h2>
+<p>A cache stores a copy of expensive-to-compute or slow-to-fetch data in a fast place (memory) so repeat requests are cheap. It is the single highest-leverage performance tool: memory access is ~100 ns, SSD ~100 µs, a DB query over the network ~1–10 ms.</p>
+<div class="diagram"><svg viewBox="0 0 900 200" width="900">
+<rect class="box" x="20" y="70" width="100" height="60"/><text class="svg-text" x="70" y="105" text-anchor="middle">App</text>
+<rect class="box cache" x="250" y="20" width="140" height="60"/><text class="svg-text" x="320" y="45" text-anchor="middle">Cache (Redis)</text><text class="svg-mono" x="320" y="65" text-anchor="middle">~0.3 ms</text>
+<rect class="box db" x="250" y="120" width="140" height="60"/><text class="svg-text" x="320" y="145" text-anchor="middle">Database</text><text class="svg-mono" x="320" y="165" text-anchor="middle">~5 ms</text>
+<path class="wire" d="M120 90 L250 50"/><path class="wire" d="M120 110 L250 150"/>
+<text class="svg-mono" x="420" y="40">1. GET user:42 → HIT? return (90% of the time)</text>
+<text class="svg-mono" x="420" y="60">2. MISS → read DB</text>
+<text class="svg-mono" x="420" y="80">3. SET user:42 (TTL 300s) → return</text>
+<text class="svg-text" x="420" y="120">Hit ratio 90% ⇒ avg latency ≈ 0.9×0.3 + 0.1×5.3 ≈ 0.8 ms</text>
+<text class="svg-text" x="420" y="140">DB load drops 10×. Hit ratio is THE metric to watch.</text>
+<circle class="packet" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M120 90 L250 50 L120 90"/></circle>
+<circle class="packet r" r="5"><animateMotion dur="4s" begin="1s" repeatCount="indefinite" path="M120 90 L250 50 L120 100 L250 150 L120 100 L250 50"/></circle>
+</svg><div class="cap">Cache-aside: the app checks the cache first and falls back to the DB on a miss.</div></div>
+
+<h3>Where caches live</h3>
+<table><tr><th>Layer</th><th>Example</th><th>Caches what</th></tr>
+<tr><td>Client</td><td>Browser cache, mobile app</td><td>Static assets, API responses (<code>Cache-Control</code>, <code>ETag</code>)</td></tr>
+<tr><td>CDN / edge</td><td>Akamai, Cloudflare, Meta's edge</td><td>Images, video, JS/CSS, sometimes whole pages. Geographically close to users.</td></tr>
+<tr><td>Reverse proxy</td><td>Nginx, Varnish</td><td>Full HTTP responses</td></tr>
+<tr><td>Application (in-process)</td><td>HashMap, Guava, Caffeine</td><td>Hot config, small lookup tables. Fastest; but per-process, inconsistent across replicas, lost on restart.</td></tr>
+<tr><td>Distributed cache</td><td>Redis, Memcached (Meta runs the world's biggest Memcache fleet)</td><td>DB query results, sessions, computed objects, counters. Shared across all app servers.</td></tr>
+<tr><td>Database</td><td>Buffer pool, query cache</td><td>Pages/blocks in RAM</td></tr>
+<tr><td>OS</td><td>Page cache</td><td>File blocks (why "free" memory looks low in Linux)</td></tr></table>
+
+<h3>Caching strategies (read & write paths)</h3>
+<div class="tabs">
+<div class="tab" data-title="Cache-aside (lazy)"><p>App reads cache → miss → read DB → write cache. Writes go to DB and <b>invalidate</b> (delete) the cache key. Most common. Cache only holds what's requested. <b>Risk:</b> stale data between DB write and invalidation; race where a slow reader writes an old value after the invalidation (fix: short TTL, or "lease"/CAS as in Meta's memcache paper).</p></div>
+<div class="tab" data-title="Read-through"><p>Cache itself loads from DB on miss (the cache library has the loader). Same semantics as cache-aside, cleaner code, cache becomes a dependency.</p></div>
+<div class="tab" data-title="Write-through"><p>Every write goes to cache <i>and</i> DB synchronously. Cache is always fresh; write latency = max of both. Pairs well with read-through. Cache may fill with data never read.</p></div>
+<div class="tab" data-title="Write-back (write-behind)"><p>Write to cache only; flush to DB asynchronously (batched). Extremely fast writes, absorbs bursts. <b>Risk:</b> data loss if cache dies before flush. Used in CPU caches, OS page cache, some counters/analytics.</p></div>
+<div class="tab" data-title="Write-around"><p>Writes bypass cache, go to DB; cache fills on read. Avoids polluting cache with write-once data (logs). First read after write is a miss.</p></div>
+</div>
+
+<h3>Eviction policies</h3>
+<div class="sim" data-sim="lru"><h4 style="margin-top:0">LRU simulator</h4>
+<div class="controls">Capacity: <select class="capsel"><option>2</option><option>3</option><option selected>4</option><option>6</option></select>
+<button class="btn sm ghost k">A</button><button class="btn sm ghost k">B</button><button class="btn sm ghost k">C</button><button class="btn sm ghost k">D</button><button class="btn sm ghost k">E</button>
+<input type="text" placeholder="custom key" style="width:110px"><button class="btn sm go">access</button></div>
+<div class="cells" style="display:flex;align-items:center;flex-wrap:wrap;min-height:50px"></div><div class="stats" style="margin-top:8px"></div>
+<p class="tag">Access A,B,C,D then A — A moves to MRU. Access E — B (least recently used) is evicted. Try a scan A,B,C,D,E,A,B,C,D,E at capacity 4 and watch the 0% hit rate: this is why scans poison LRU caches.</p></div>
+<ul><li><b>LRU</b> (least recently used): doubly-linked list + hash map, O(1). Default almost everywhere. Weak against scans.</li><li><b>LFU</b>: evict least frequently used. Better for stable popularity; slow to adapt; needs decay.</li><li><b>FIFO</b>, <b>Random</b>: simple, surprisingly OK in some workloads.</li><li><b>TTL</b>: expire after time; bounds staleness. Redis combines TTL + approximated LRU/LFU sampling.</li><li><b>ARC / W-TinyLFU</b>: adaptive hybrids (Caffeine) resistant to scans and one-hit wonders.</li></ul>
+
+<h3>Cache problems you must know <span class="badge deep">deep dive</span></h3>
+<details class="reveal"><summary>Cache invalidation & staleness</summary><p>"There are only two hard things in CS: cache invalidation and naming things." Options: TTL (simple, bounded staleness), explicit delete-on-write (precise, race-prone), versioned keys (<code>user:42:v7</code> — never invalidate, just stop referencing), event-driven invalidation via a change-data-capture stream (Meta's approach with Wormhole/TAO). Rule: <b>delete, don't update</b>, the cache on write — updating risks reordered writes leaving a stale value permanently.</p></details>
+<details class="reveal"><summary>Cache stampede / thundering herd</summary><p>A hot key expires → thousands of concurrent requests miss simultaneously → all hit the DB → DB falls over. <b>Fixes:</b> (1) <b>request coalescing / single-flight</b>: only one request recomputes, others wait; (2) <b>leases</b> (Memcache): cache hands a token to the first misser; (3) <b>probabilistic early refresh</b>: refresh slightly before expiry with increasing probability; (4) <b>stale-while-revalidate</b>: serve stale, refresh in background; (5) jittered TTLs so keys don't expire together.</p></details>
+<details class="reveal"><summary>Cold start / cache warming</summary><p>A new or restarted cache has 0% hit rate → full load hits the DB. Fixes: pre-warm from a snapshot or replaying recent keys, gradual traffic ramp (slow-start in the LB), keep DB provisioned to survive a cache outage (or accept degraded mode with load shedding).</p></details>
+<details class="reveal"><summary>Hot keys</summary><p>A celebrity's profile or a viral post gets 1M QPS on one key → one cache shard saturates (network or CPU). Fixes: replicate the hot key across N shards (<code>key#1..N</code>, read random), local in-process cache for the hottest items (L1 cache in app), detect hot keys via sampling and auto-promote.</p></details>
+<details class="reveal"><summary>Big keys & memory fragmentation</summary><p>A 50 MB value blocks the Redis single thread for ms, hurts p99. Split big values, compress, or store in blob storage with a pointer in cache. Watch <code>used_memory</code> vs RSS for fragmentation.</p></details>
+<details class="reveal"><summary>Consistency between cache replicas / regions</summary><p>Multi-region caches see writes at different times. Meta: writes go to the primary region's DB; MySQL replication stream carries invalidations ("mcsqueal") to remote regions' caches; remote-region readers after a write can be routed to the primary briefly ("remote marker"). Read the 2013 "Scaling Memcache at Facebook" paper — it is practically a PE interview script.</p></details>
+
+<h3>Redis vs Memcached</h3>
+<table><tr><th></th><th>Memcached</th><th>Redis</th></tr>
+<tr><td>Data model</td><td>String → bytes only</td><td>Strings, hashes, lists, sets, sorted sets, streams, HyperLogLog, bitmaps, geo</td></tr>
+<tr><td>Threading</td><td>Multi-threaded; scales with cores</td><td>Single-threaded command execution (I/O threads optional); predictable, no locks</td></tr>
+<tr><td>Persistence</td><td>None</td><td>RDB snapshots, AOF log — can act as a primary store</td></tr>
+<tr><td>Replication / HA</td><td>None built-in (client-side sharding)</td><td>Primary-replica, Sentinel, Redis Cluster (16384 hash slots)</td></tr>
+<tr><td>Use</td><td>Pure, massive, simple cache</td><td>Cache + leaderboards, rate limiters, pub/sub, locks, queues, sessions</td></tr></table>
+
+<h3>CDN (Content Delivery Network)</h3>
+<p>Hundreds of edge PoPs cache static (and increasingly dynamic) content near users. <b>Push CDN:</b> you upload content to the CDN proactively (good for rarely-changing, large files). <b>Pull CDN:</b> edge fetches from origin on first miss, then caches per TTL (simpler, standard). Cache key = URL (+ selected headers). Invalidate by purging or, better, by <b>fingerprinting</b> filenames (<code>app.3f9a1c.js</code>) with immutable long TTLs. CDNs also absorb DDoS, terminate TLS near users, and do image resizing/video segment delivery.</p>
+
+<!-- ============================================================ -->
+<h2>Databases: the storage layer <span class="badge basic">basics</span></h2>
+<p>A database durably stores data and lets you query it. The two big families, and the honest truth: <b>start with a relational DB</b> (Postgres/MySQL) unless you have a specific reason not to.</p>
+<div class="compare">
+<div class="card"><h4>Relational / SQL</h4><p>Tables with fixed schemas, rows, foreign keys. Strong ACID transactions, rich queries (JOINs, aggregations), mature tooling. Scales reads via replicas easily; scales writes via sharding with effort. <b>MySQL, PostgreSQL</b>. Meta runs one of the largest MySQL fleets in the world (with its own storage engine, MyRocks).</p></div>
+<div class="card"><h4>NoSQL</h4><p>Umbrella for everything else; each trades some SQL power for scale or flexibility:<br>• <b>Key-value</b> (Redis, DynamoDB, RocksDB): get/put by key. Fastest, simplest.<br>• <b>Wide-column</b> (Cassandra, HBase, Bigtable): rows with dynamic columns, partitioned by key, sorted within partition. Huge write throughput.<br>• <b>Document</b> (MongoDB, Couchbase): JSON docs, flexible schema, nested data.<br>• <b>Graph</b> (Neo4j, TAO at Meta): nodes & edges, traversal queries (friends-of-friends).<br>• <b>Time-series</b> (Prometheus, InfluxDB, Gorilla/Beringei at Meta): append-mostly, time-bucketed, compressed.<br>• <b>Search</b> (Elasticsearch, Solr): inverted indexes for text.</p></div>
+</div>
+
+<h3>How a database stores and finds data: indexes</h3>
+<p>Without an index, finding a row = scanning the whole table (O(n)). An <b>index</b> is a separate sorted structure mapping a column's values → row locations.</p>
+<div class="diagram"><svg viewBox="0 0 900 260" width="900">
+<rect class="box hl" x="380" y="20" width="140" height="40"/><text class="svg-mono" x="450" y="45" text-anchor="middle">[ 40 | 80 ]</text>
+<rect class="box" x="130" y="100" width="140" height="40"/><text class="svg-mono" x="200" y="125" text-anchor="middle">[ 10 | 25 ]</text>
+<rect class="box" x="380" y="100" width="140" height="40"/><text class="svg-mono" x="450" y="125" text-anchor="middle">[ 50 | 65 ]</text>
+<rect class="box" x="630" y="100" width="140" height="40"/><text class="svg-mono" x="700" y="125" text-anchor="middle">[ 85 | 92 ]</text>
+<path class="wire" d="M400 60 L200 100"/><path class="wire" d="M450 60 V100"/><path class="wire" d="M500 60 L700 100"/>
+<g class="svg-mono"><rect class="box db" x="20" y="190" width="80" height="34"/><text x="60" y="212" text-anchor="middle">1..9</text>
+<rect class="box db" x="110" y="190" width="80" height="34"/><text x="150" y="212" text-anchor="middle">10..24</text>
+<rect class="box db" x="200" y="190" width="80" height="34"/><text x="240" y="212" text-anchor="middle">25..39</text>
+<rect class="box db" x="320" y="190" width="80" height="34"/><text x="360" y="212" text-anchor="middle">40..49</text>
+<rect class="box db" x="410" y="190" width="80" height="34"/><text x="450" y="212" text-anchor="middle">50..64</text>
+<rect class="box db" x="500" y="190" width="80" height="34"/><text x="540" y="212" text-anchor="middle">65..79</text>
+<rect class="box db" x="620" y="190" width="80" height="34"/><text x="660" y="212" text-anchor="middle">80..84</text>
+<rect class="box db" x="710" y="190" width="80" height="34"/><text x="750" y="212" text-anchor="middle">85..91</text>
+<rect class="box db" x="800" y="190" width="80" height="34"/><text x="840" y="212" text-anchor="middle">92..</text></g>
+<path class="wire" d="M160 140 L60 190"/><path class="wire" d="M200 140 L150 190"/><path class="wire" d="M240 140 L240 190"/>
+<path class="wire" d="M410 140 L360 190"/><path class="wire" d="M450 140 V190"/><path class="wire" d="M490 140 L540 190"/>
+<path class="wire" d="M660 140 L660 190"/><path class="wire" d="M700 140 L750 190"/><path class="wire" d="M740 140 L840 190"/>
+<path class="wire" d="M100 207 H110" stroke="#38d9f5"/><path class="wire" d="M190 207 H200" stroke="#38d9f5"/><path class="wire" d="M280 207 H320" stroke="#38d9f5"/><path class="wire" d="M400 207 H410" stroke="#38d9f5"/><path class="wire" d="M490 207 H500" stroke="#38d9f5"/><path class="wire" d="M580 207 H620" stroke="#38d9f5"/><path class="wire" d="M700 207 H710" stroke="#38d9f5"/><path class="wire" d="M790 207 H800" stroke="#38d9f5"/>
+<circle class="packet y" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M450 40 L450 120 L540 207 L580 207"/></circle>
+<text class="svg-text" x="20" y="250">B+ tree: find key 70 → root (40|80) → middle child (50|65) → leaf 65..79. 3–4 disk reads for billions of rows. Leaves are linked for range scans.</text>
+</svg></div>
+<ul><li><b>B+ tree</b> (MySQL InnoDB, Postgres): balanced, sorted, O(log n), great for point lookups <i>and</i> range queries (<code>WHERE ts BETWEEN</code>). Updates in place → random I/O.</li><li><b>Hash index</b>: O(1) equality only; no ranges. Memory stores (Redis), some engines.</li><li><b>LSM tree</b> (RocksDB, Cassandra, HBase, MyRocks): writes go to an in-memory memtable + sequential write-ahead log; flushed as immutable sorted files (SSTables); background <b>compaction</b> merges them. Sequential I/O → very high write throughput and better compression; reads may check multiple levels (mitigated by Bloom filters). <b>Write-optimized vs B-tree's read-optimized.</b></li><li><b>Inverted index</b>: term → list of documents. Full-text search.</li><li><b>Composite index</b> on (a, b): usable for <code>WHERE a=…</code> and <code>WHERE a=… AND b=…</code>, but NOT <code>WHERE b=…</code> alone (leftmost-prefix rule).</li><li><b>Covering index</b>: index contains all queried columns → no table lookup.</li></ul>
+<div class="callout warn"><b>Indexes aren't free</b>Each index slows every write (must update N trees), consumes storage, and the DB can only use so many per query. Index what you filter/sort/join on; never index blindly.</div>
+
+<h3>Transactions and ACID</h3>
+<div class="grid">
+<div class="card"><h4>Atomicity</h4>All or nothing. Transfer $100: debit AND credit, or neither. Implemented via undo logs / WAL.</div>
+<div class="card"><h4>Consistency</h4>Constraints (unique, FK, checks) hold before and after. (Different meaning from CAP's "consistency"!)</div>
+<div class="card"><h4>Isolation</h4>Concurrent transactions don't see each other's partial work. Levels: Read Uncommitted → Read Committed → Repeatable Read (MySQL default) → Serializable. Implemented via MVCC and/or locks.</div>
+<div class="card"><h4>Durability</h4>Once committed, survives crashes. Write-ahead log fsync'd to disk before ack. (fsync latency ≈ 1–10 ms on SSD → why DBs batch commits.)</div>
+</div>
+<details class="reveal"><summary>Isolation anomalies & MVCC <span class="badge deep">deep dive</span></summary>
+<table><tr><th>Anomaly</th><th>What</th><th>Prevented by</th></tr>
+<tr><td>Dirty read</td><td>See another txn's uncommitted write</td><td>Read Committed+</td></tr>
+<tr><td>Non-repeatable read</td><td>Same row read twice gives different values</td><td>Repeatable Read+</td></tr>
+<tr><td>Phantom read</td><td>Range query returns new rows on re-run</td><td>Serializable (or RR with gap locks in InnoDB)</td></tr>
+<tr><td>Lost update</td><td>Two read-modify-writes, one overwrites the other</td><td><code>SELECT … FOR UPDATE</code>, atomic <code>UPDATE x = x+1</code>, optimistic version check</td></tr>
+<tr><td>Write skew</td><td>Two txns each check a condition then write, violating an invariant together (two doctors both going off-call)</td><td>Serializable</td></tr></table>
+<p><b>MVCC</b> (multi-version concurrency control): each write creates a new version tagged with a transaction ID; readers see the snapshot as of their start → readers never block writers. Old versions are garbage-collected (Postgres VACUUM, InnoDB purge). This is how Postgres/MySQL/Oracle do it.</p>
+<p><b>Optimistic vs pessimistic locking:</b> pessimistic = lock rows up front (safe, contention). Optimistic = read a version number, write with <code>WHERE version = v</code>, retry on conflict (great for low contention).</p></details>
+
+<h3>Choosing a database in an interview</h3>
+<table><tr><th>Need</th><th>Pick</th><th>Why</th></tr>
+<tr><td>Transactions, relations, complex queries, moderate scale</td><td>PostgreSQL / MySQL</td><td>ACID, joins, mature. Add replicas and cache before anything exotic.</td></tr>
+<tr><td>Massive write throughput, time-ordered data per key, multi-DC</td><td>Cassandra / Scylla / HBase</td><td>LSM, leaderless, linear scale, tunable consistency. No joins, query-driven schema.</td></tr>
+<tr><td>Simple key → value at huge scale with low latency</td><td>DynamoDB / Redis / RocksDB</td><td>O(1) by key, horizontally partitioned.</td></tr>
+<tr><td>Flexible / nested documents, fast iteration</td><td>MongoDB</td><td>Schema-light, good secondary indexes.</td></tr>
+<tr><td>Full-text search, fuzzy matching, aggregations on logs</td><td>Elasticsearch</td><td>Inverted index; near-realtime; not a primary store.</td></tr>
+<tr><td>Metrics (billions of time-series)</td><td>Prometheus / Gorilla-style TSDB</td><td>Delta-of-delta & XOR compression, in-memory recent window.</td></tr>
+<tr><td>Social graph traversal</td><td>Graph DB / TAO</td><td>Edges as first-class; cached graph API over MySQL at Meta.</td></tr>
+<tr><td>Large files (images, video, backups)</td><td>Object storage (S3, Haystack/f4 at Meta)</td><td>Store a URL/ID in the DB, bytes in blob store. Never BLOBs in SQL.</td></tr>
+<tr><td>Analytics over petabytes</td><td>Data warehouse (BigQuery, Snowflake, Presto/Hive)</td><td>Columnar, batch, separate from OLTP.</td></tr></table>
+
+<!-- ============================================================ -->
+<h2>Replication <span class="badge basic">basics</span></h2>
+<p>Replication = keeping copies of the same data on multiple machines. Why: <b>(1) availability</b> — a replica takes over if the primary dies; <b>(2) read scaling</b> — spread reads across replicas; <b>(3) latency</b> — put copies near users; <b>(4) durability</b> — data survives disk loss.</p>
+
+<h3>Single-leader (primary–replica)</h3>
+<div class="diagram"><svg viewBox="0 0 900 230" width="900">
+<rect class="box" x="20" y="90" width="90" height="50"/><text class="svg-text" x="65" y="120" text-anchor="middle">Clients</text>
+<rect class="box db hl" x="260" y="85" width="140" height="60"/><text class="svg-text" x="330" y="110" text-anchor="middle">Primary (leader)</text><text class="svg-mono" x="330" y="128" text-anchor="middle">reads + ALL writes</text>
+<rect class="box db" x="560" y="20" width="130" height="50"/><text class="svg-text" x="625" y="50" text-anchor="middle">Replica 1</text>
+<rect class="box db" x="560" y="90" width="130" height="50"/><text class="svg-text" x="625" y="120" text-anchor="middle">Replica 2</text>
+<rect class="box db" x="560" y="160" width="130" height="50"/><text class="svg-text" x="625" y="190" text-anchor="middle">Replica 3 (other DC)</text>
+<path class="wire" d="M110 105 H260"/><text class="svg-mono" x="130" y="98">writes</text>
+<path class="wire" d="M110 125 L560 185" stroke-dasharray="4 4"/><text class="svg-mono" x="130" y="150">reads (any replica)</text>
+<path class="wire anim" d="M400 105 L560 45"/><path class="wire anim" d="M400 115 H560"/><path class="wire anim" d="M400 125 L560 185"/>
+<text class="svg-mono" x="420" y="75">replication log (binlog / WAL)</text>
+<circle class="packet" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M110 105 H260"/></circle>
+<circle class="packet g" r="4"><animateMotion dur="2s" begin=".8s" repeatCount="indefinite" path="M400 105 L560 45"/></circle>
+<circle class="packet g" r="4"><animateMotion dur="2s" begin=".8s" repeatCount="indefinite" path="M400 115 H560"/></circle>
+<circle class="packet g" r="4"><animateMotion dur="2.8s" begin=".8s" repeatCount="indefinite" path="M400 125 L560 185"/></circle>
+<text class="svg-mono" x="720" y="190">← slower link = more lag</text>
+</svg></div>
+<ul><li><b>Synchronous replication:</b> leader waits for replica ack before confirming the write. No data loss on failover; but write latency = slowest replica, and one dead replica blocks writes. Usually <b>semi-synchronous</b>: wait for 1 of N replicas.</li><li><b>Asynchronous:</b> leader confirms immediately, streams changes later. Fast; but <b>replication lag</b> (ms to seconds, or minutes under load) → stale reads, and the most recent writes are lost if the leader dies.</li></ul>
+
+<h3>Problems caused by replication lag <span class="badge deep">deep dive</span></h3>
+<details class="reveal"><summary>Read-your-own-writes</summary><p>User updates profile, refreshes, sees the old one (read hit a lagging replica). Fixes: read from the leader for a few seconds after a write (track last-write timestamp per user, in a cookie or session); route reads of "own" data to the leader; replicas report their position and clients wait until caught up.</p></details>
+<details class="reveal"><summary>Monotonic reads</summary><p>User sees a comment, refreshes, it disappears (second read hit a more-lagged replica). Fix: pin each user to one replica (hash user id → replica).</p></details>
+<details class="reveal"><summary>Consistent prefix / causality</summary><p>Observer sees the answer before the question because they replicated through different partitions. Fix: write causally related data to the same partition; or causal-consistency tracking (version vectors).</p></details>
+
+<h3>Failover: when the leader dies</h3>
+<div class="steps">
+<div class="step"><b>Detect:</b> heartbeats time out (e.g., 10–30 s). Too short → false positives under load spikes; too long → longer outage.</div>
+<div class="step"><b>Elect:</b> choose the most up-to-date replica (consensus — see Raft — or an orchestrator like Orchestrator/MHA, or ZooKeeper).</div>
+<div class="step"><b>Reconfigure:</b> clients and other replicas point to the new leader (update DNS/VIP/service discovery/proxy).</div>
+<div class="step"><b>Dangers:</b> <b>split brain</b> — old leader comes back thinking it's still leader; two leaders accept writes → divergence. Needs <b>fencing</b> (STONITH: "shoot the other node in the head", or epoch/fencing tokens). Lost writes: async replicas lacked the old leader's last transactions → discard them (data loss) or reconcile. The GitHub 2018 outage is the canonical case study: a 43-second network blip caused a cross-DC failover with divergent writes and a 24-hour degraded recovery.</div>
+</div>
+
+<h3>Multi-leader</h3>
+<p>Each datacenter has its own leader accepting writes; leaders replicate asynchronously to each other. Pros: local write latency, DC-level fault tolerance, offline clients (calendar apps, CRDT docs). Cons: <b>write conflicts</b> — the same row changed in two places. Resolution: last-writer-wins (LWW, loses data silently), per-field merge, application-level merge, CRDTs (conflict-free replicated data types — counters, sets, text that merge mathematically). Avoid unless you really need it; when needed, partition so each record has a "home" region.</p>
+
+<h3>Leaderless replication & quorums (Dynamo-style)</h3>
+<p>No leader. Client (or coordinator) writes to all N replicas, waits for W acks; reads from all N, waits for R responses, takes the newest version. <b>If W + R &gt; N</b>, every read set overlaps every write set → at least one replica has the latest value → strong-ish consistency. Cassandra, Riak, DynamoDB, Voldemort.</p>
+<div class="sim" data-sim="quorum"><h4 style="margin-top:0">Quorum calculator</h4>
+<div class="controls"><label>N (replicas) = <span class="nv"></span><input class="n" type="range" min="1" max="7" value="3"></label><label>W (write acks) = <span class="wv"></span><input class="w" type="range" min="1" max="3" value="2"></label><label>R (read responses) = <span class="rv"></span><input class="r" type="range" min="1" max="3" value="2"></label></div><div class="out"></div></div>
+<ul><li><b>Sloppy quorum & hinted handoff:</b> if home replicas are down, write to any N reachable nodes, who "hand off" the data when the home nodes return. Availability over consistency.</li><li><b>Read repair:</b> on read, if replicas disagree, write the newest version back to stale ones.</li><li><b>Anti-entropy:</b> background process comparing <b>Merkle trees</b> between replicas to find & fix differences efficiently.</li><li><b>Version vectors / vector clocks:</b> detect concurrent writes (siblings) rather than silently losing one. Clients must merge.</li></ul>
+
+<!-- ============================================================ -->
+<h2>Partitioning (sharding) <span class="badge basic">basics</span></h2>
+<p>Replication copies <i>all</i> data to every node — it doesn't help when the data (or write load) is too big for one machine. <b>Partitioning</b> splits the dataset so each node holds a subset (a <b>shard</b>). Usually combined: each shard is itself replicated.</p>
+<div class="diagram"><svg viewBox="0 0 900 250" width="900">
+<rect class="box" x="20" y="95" width="90" height="50"/><text class="svg-text" x="65" y="125" text-anchor="middle">App</text>
+<rect class="box hl" x="180" y="90" width="150" height="60"/><text class="svg-text" x="255" y="113" text-anchor="middle">Router / Shard map</text><text class="svg-mono" x="255" y="133" text-anchor="middle">shard = f(user_id)</text>
+<g><rect class="box db" x="430" y="20" width="120" height="50"/><text class="svg-text" x="490" y="50" text-anchor="middle">Shard 0</text><rect class="box db" x="570" y="20" width="90" height="50" opacity=".5"/><text class="svg-text" x="615" y="50" text-anchor="middle">replica</text><rect class="box db" x="680" y="20" width="90" height="50" opacity=".5"/><text class="svg-text" x="725" y="50" text-anchor="middle">replica</text></g>
+<g><rect class="box db" x="430" y="100" width="120" height="50"/><text class="svg-text" x="490" y="130" text-anchor="middle">Shard 1</text><rect class="box db" x="570" y="100" width="90" height="50" opacity=".5"/><text class="svg-text" x="615" y="130" text-anchor="middle">replica</text><rect class="box db" x="680" y="100" width="90" height="50" opacity=".5"/><text class="svg-text" x="725" y="130" text-anchor="middle">replica</text></g>
+<g><rect class="box db" x="430" y="180" width="120" height="50"/><text class="svg-text" x="490" y="210" text-anchor="middle">Shard 2</text><rect class="box db" x="570" y="180" width="90" height="50" opacity=".5"/><text class="svg-text" x="615" y="210" text-anchor="middle">replica</text><rect class="box db" x="680" y="180" width="90" height="50" opacity=".5"/><text class="svg-text" x="725" y="210" text-anchor="middle">replica</text></g>
+<path class="wire" d="M110 120 H180"/><path class="wire" d="M330 110 L430 45"/><path class="wire" d="M330 120 H430"/><path class="wire" d="M330 130 L430 205"/>
+<circle class="packet" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M110 120 H330 L430 205"/></circle>
+<circle class="packet g" r="5"><animateMotion dur="2s" begin=".7s" repeatCount="indefinite" path="M110 120 H330 L430 45"/></circle>
+<circle class="packet y" r="5"><animateMotion dur="2s" begin="1.4s" repeatCount="indefinite" path="M110 120 H330 H430"/></circle>
+<text class="svg-mono" x="20" y="240">Each shard: 1/3 of the data, 1/3 of the writes. Each shard replicated 3× for availability. Total = 9 nodes.</text>
+</svg></div>
+
+<h3>Partitioning strategies</h3>
+<div class="tabs">
+<div class="tab" data-title="Range"><p>Shard by key ranges: A–F, G–M, N–Z; or by time: 2024-01, 2024-02. <b>Pro:</b> range queries hit one shard; sorted scans are efficient. <b>Con:</b> <b>hot spots</b> — all today's writes go to the "current" shard; celebrity names cluster. Used by HBase, Bigtable, Spanner (with automatic splitting).</p></div>
+<div class="tab" data-title="Hash"><p>shard = hash(key) mod N (or consistent hashing). <b>Pro:</b> uniform distribution, no hot spots from key skew. <b>Con:</b> range queries must hit all shards (scatter-gather); adjacent keys are scattered. Cassandra uses hash for the partition key but <i>sorts within the partition</i> by clustering columns — best of both for "all messages for chat X ordered by time".</p></div>
+<div class="tab" data-title="Directory / lookup"><p>A separate service maps key → shard (e.g., user_id → shard in a lookup table or ZooKeeper). <b>Pro:</b> total flexibility, can move individual tenants, handle hot tenants specially. <b>Con:</b> lookup service is a SPOF & extra hop (cache it heavily). Used by Vitess, many multi-tenant SaaS, Meta's shard manager.</p></div>
+<div class="tab" data-title="Geo / entity"><p>Shard by region (EU users in EU) for latency and data-residency law; or by entity (all of a company's data on one shard). Good locality; uneven shard sizes.</p></div>
+</div>
+
+<h3>The rebalancing problem & consistent hashing <span class="badge deep">deep dive</span></h3>
+<p>With <code>hash(key) mod N</code>, going from N=3 to N=4 nodes remaps ~75% of keys → massive data movement / cache miss storm. <b>Consistent hashing</b> places nodes and keys on a ring; each key belongs to the first node clockwise. Adding a node only steals keys from its one neighbor (~1/N of keys move).</p>
+<div class="sim" data-sim="chash"><h4 style="margin-top:0">Consistent hashing ring</h4>
+<div class="controls"><button class="btn sm add">+ Add node</button><button class="btn sm ghost rm">− Remove node</button><label>Virtual nodes per server: <span class="vnv">1</span><input class="vn" type="range" min="1" max="50" value="1" style="width:160px"></label></div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start"><canvas width="380" height="380"></canvas><div><p class="tag">Dots on the inner ring are keys; colored arcs show which node owns which range. Add a node and read the log: only a small fraction of keys move. Then slide virtual nodes up: with 1 vnode the arcs are badly uneven (one node may own 50% of keys); with 50 vnodes each node owns ≈ equal share, and removing a node spreads its keys across <i>all</i> survivors instead of dumping them on one neighbor.</p><div class="log"></div></div></div></div>
+<p><b>Virtual nodes (vnodes):</b> each physical server gets 100–200 points on the ring → even load, heterogeneous weights (bigger server → more vnodes), and smooth redistribution on failure. Used by Cassandra, DynamoDB, Riak, Memcache clients (ketama), Discord, and the L4 load balancer Maglev uses a related lookup-table scheme.</p>
+<p><b>Alternatives:</b> fixed number of many small partitions (e.g., 1024) assigned to nodes via a map (Kafka, Elasticsearch, Redis Cluster's 16384 slots) — simpler to reason about, just move whole partitions. <b>Jump consistent hash</b> and <b>rendezvous (HRW) hashing</b> are stateless alternatives.</p>
+
+<h3>Hard problems with sharding</h3>
+<details class="reveal"><summary>Hot shards / celebrity problem</summary><p>Even with hashing, one <i>key</i> can be hot (Justin Bieber's followers list). Fixes: split hot keys with a suffix (key#0..k) and fan out; dedicated handling for "whale" entities; app-level caching of hot items; for write-hot keys, aggregate in memory then flush.</p></details>
+<details class="reveal"><summary>Cross-shard queries & joins</summary><p>"Find all posts by users in city X" must query every shard (scatter-gather) → latency = slowest shard, load ×N. Fixes: denormalize (store what you need together), secondary-index service (local index per shard = scatter on read; global index partitioned by indexed term = scatter on write), async-materialized views, or a separate search/analytics system fed by CDC.</p></details>
+<details class="reveal"><summary>Cross-shard transactions</summary><p>Moving money between users on different shards. Options: <b>two-phase commit</b> (2PC: coordinator asks all "prepare?", then "commit" — blocking if coordinator dies; slow); <b>sagas</b> (sequence of local transactions with compensating actions on failure — eventually consistent); choose shard keys so related entities co-locate (shard by account, not by transaction); use a DB with distributed transactions built in (Spanner, CockroachDB, TiDB — at a latency cost).</p></details>
+<details class="reveal"><summary>Unique IDs across shards</summary><p>Auto-increment doesn't work across shards. Options: UUIDv4 (random 128-bit; bad B-tree locality), <b>Snowflake IDs</b> (64-bit: 41-bit timestamp + 10-bit machine id + 12-bit sequence → time-sortable, 4096/ms/machine; Twitter, Instagram's variant includes shard id), DB ticket server (Flickr: one MySQL that only hands out IDs — SPOF unless two with odd/even), ULID/KSUID (sortable, string-friendly).</p></details>
+<details class="reveal"><summary>Resharding live</summary><p>Double shards with zero downtime: (1) start dual-writing to old and new layout; (2) backfill historical data; (3) verify (checksums); (4) switch reads; (5) stop writing to old. Use a directory-based shard map so the switch is a config flip. Pre-split into many logical shards (e.g., 4096) mapped onto few physical nodes so "resharding" is just moving logical shards.</p></details>
+
+<div class="footer-nav"><a href="index.html">← Home</a><a href="#consistency-cap-and-the-real-trade-offs">Continue: Consistency, CAP, Consensus →</a></div>
+
+<!-- ============================================================ -->
+<h2>Consistency, CAP, and the real trade-offs <span class="badge basic">basics</span></h2>
+<p>Once data lives on more than one machine, you face the question: <b>when a client reads, which version do they see?</b> "Consistency" in distributed systems means "all clients see the same data at the same time" (not the ACID meaning).</p>
+<div class="sim" data-sim="cap"><h4 style="margin-top:0">CAP, interactively</h4>
+<div class="diagram" style="margin:0 0 10px"><svg viewBox="0 0 700 140" width="700">
+<rect class="box db" x="40" y="40" width="160" height="60"/><text class="svg-text" x="120" y="65" text-anchor="middle">Replica A (US)</text><text class="svg-mono" x="120" y="85" text-anchor="middle">balance = $100</text>
+<rect class="box db" x="500" y="40" width="160" height="60"/><text class="svg-text" x="580" y="65" text-anchor="middle">Replica B (EU)</text><text class="svg-mono" x="580" y="85" text-anchor="middle">balance = $100</text>
+<path class="wire anim" d="M200 70 H500"/><text class="svg-text" x="350" y="60" text-anchor="middle">replication link</text>
+<text class="svg-mono" x="20" y="125">client in US writes $50 to A → client in EU reads from B. What does B return?</text></svg></div>
+<div class="controls"><button class="btn sm net">Cut the network (partition)</button><label style="flex-direction:row;gap:14px;align-items:center"><span><input type="radio" name="cap" value="C" checked> Choose Consistency (CP)</span><span><input type="radio" name="cap" value="A"> Choose Availability (AP)</span></label></div><div class="out"></div></div>
+<p><b>CAP theorem</b> (Brewer): when a network <b>P</b>artition happens, a distributed system must choose between <b>C</b>onsistency (every read returns the latest write or an error) and <b>A</b>vailability (every request gets a non-error response). Partitions are not optional in real networks, so the choice is really C-vs-A <i>during</i> failures.</p>
+<p><b>PACELC</b> extends it: if Partition → A or C; <b>E</b>lse (normal operation) → <b>L</b>atency or <b>C</b>onsistency. Even without failures, synchronous replication (consistency) costs latency. DynamoDB/Cassandra: PA/EL. Spanner/ZooKeeper: PC/EC. MySQL async replication: PA/EL-ish.</p>
+<div class="callout warn"><b>Interview trap</b>Don't say "we pick AP" and move on. Say <i>which operations</i> need which guarantee: "Likes count can be eventually consistent; account balance and username uniqueness need strong consistency, so those paths go through the leader with synchronous replication."</div>
+
+<h3>Consistency models, weakest → strongest <span class="badge deep">deep dive</span></h3>
+<table><tr><th>Model</th><th>Guarantee</th><th>Example</th></tr>
+<tr><td>Eventual</td><td>If writes stop, replicas converge eventually. No ordering promise.</td><td>DNS, Cassandra ONE/ONE, S3 (pre-2020)</td></tr>
+<tr><td>Read-your-writes</td><td>A client sees its own writes.</td><td>Session pinning to leader</td></tr>
+<tr><td>Monotonic reads</td><td>A client never sees time go backwards.</td><td>Sticky replica</td></tr>
+<tr><td>Causal</td><td>Causally related operations are seen in order by everyone; concurrent ones may differ.</td><td>Comments appear after the post they reply to. COPS, MongoDB causal sessions</td></tr>
+<tr><td>Sequential</td><td>All clients see the same global order, consistent with each client's program order (but not necessarily real time).</td><td>ZooKeeper (for writes)</td></tr>
+<tr><td>Linearizable (strong)</td><td>Behaves as if a single copy; every op appears to happen atomically at some instant between its start and end, respecting real time.</td><td>etcd, ZooKeeper sync reads, Spanner, single-leader sync replication. Needed for locks, leader election, uniqueness.</td></tr>
+<tr><td>Serializable (ACID)</td><td>Transactions appear to run one at a time (ordering of <i>transactions</i>, not real time). <b>Strict serializable</b> = serializable + linearizable.</td><td>Spanner, CockroachDB, Postgres SERIALIZABLE</td></tr></table>
+
+<h3>Idempotency: the practical consistency tool</h3>
+<p>Networks fail; clients retry; the server may receive the same request twice. An <b>idempotent</b> operation produces the same result no matter how many times it runs. <code>PUT /balance {value: 50}</code> is idempotent; <code>POST /deduct {amount: 50}</code> is not. Make non-idempotent operations idempotent with an <b>idempotency key</b>: client generates a unique request ID; server stores processed IDs (with TTL) and returns the stored response on duplicates. Stripe's API is the canonical example. Essential for payments, queue consumers (at-least-once delivery), and any retry logic.</p>
+
+<!-- ============================================================ -->
+<h2>Consensus & coordination <span class="badge deep">deep dive</span></h2>
+<p>Many problems reduce to <b>getting several machines to agree on one value</b>: who is the leader? what is the next log entry? who holds the lock? That's <b>consensus</b>. It's hard because machines crash, messages get delayed, and clocks are unreliable — you can't distinguish "slow" from "dead".</p>
+<div class="sim" data-sim="raft"><h4 style="margin-top:0">Raft leader election simulator</h4>
+<div class="controls"><button class="btn sm kill-leader">Kill the leader</button><button class="btn sm ghost partition">Crash a majority</button><button class="btn sm ghost revive">Revive all</button></div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start"><canvas width="380" height="330"></canvas><div><p class="tag">Green = leader, yellow = candidate, dark = follower. The arc around each node is its randomized election timer, reset by every heartbeat (blue dots). Kill the leader → heartbeats stop → the first follower to time out becomes a candidate, increments the term, requests votes (yellow), wins with a majority (green dots), and starts sending heartbeats. Crash a majority → nobody can win → cluster is unavailable but never inconsistent.</p><div class="log"></div></div></div></div>
+
+<h3>Raft, in plain terms</h3>
+<div class="steps">
+<div class="step"><b>Roles:</b> leader, follower, candidate. One leader per <b>term</b> (a monotonically increasing number acting as a logical clock).</div>
+<div class="step"><b>Election:</b> followers expect heartbeats. Timeout (randomized 150–300 ms to avoid ties) → become candidate, term++, vote for self, request votes. Majority → leader. Nodes vote for at most one candidate per term, and only one whose log is at least as up-to-date.</div>
+<div class="step"><b>Log replication:</b> client writes go to the leader; leader appends to its log and sends AppendEntries to followers; once a <b>majority</b> acknowledge, the entry is <b>committed</b> and applied to the state machine; followers learn commit index from later heartbeats.</div>
+<div class="step"><b>Safety:</b> a committed entry is never lost because any future leader must have a majority's votes, and a majority includes at least one node with that entry. Majorities always overlap — that's the whole trick.</div>
+<div class="step"><b>Cost:</b> every write = 1 RTT to a majority. 5 nodes tolerate 2 failures; 3 tolerate 1. Use odd counts. Don't run 100 nodes in a Raft group — use it for small metadata, not for data.</div>
+</div>
+<p><b>Paxos</b> is the older, equivalent-in-power protocol (Multi-Paxos ≈ Raft); Raft was designed to be understandable. <b>Zab</b> is ZooKeeper's variant. All three: majority quorums, leader-based, linearizable log.</p>
+
+<h3>Coordination services: ZooKeeper / etcd / Chubby</h3>
+<p>Small, strongly consistent, highly available key-value stores built on consensus. You don't put your data there — you put <b>coordination metadata</b> there:</p>
+<ul><li><b>Leader election:</b> everyone tries to create an ephemeral node <code>/leader</code>; whoever succeeds is leader; if it dies, its session expires, the node vanishes, and watchers race again.</li><li><b>Service discovery / membership:</b> each instance registers an ephemeral node; clients watch the directory.</li><li><b>Distributed locks:</b> ephemeral sequential nodes; lowest sequence holds the lock; watch the one before you (avoids herd).</li><li><b>Configuration:</b> config in znodes; clients get watch notifications on change. Kubernetes stores its entire cluster state in etcd.</li><li><b>Shard assignment:</b> which node owns which partition (Kafka used ZK until KRaft).</li></ul>
+
+<h3>Distributed locks are dangerous</h3>
+<div class="diagram"><svg viewBox="0 0 900 200" width="900">
+<text class="svg-text" x="20" y="25">Client 1 acquires lock (lease 10s) ────── GC pause 15s ────── wakes, still thinks it holds lock ── writes ✗</text>
+<text class="svg-text" x="20" y="60">Lock service:              lease expires at 10s ──→ grants to Client 2</text>
+<text class="svg-text" x="20" y="95">Client 2:                                             acquires lock ──── writes ✓</text>
+<rect x="20" y="115" width="860" height="70" fill="#1a1020" stroke="#ff5c7a" rx="8"/>
+<text class="svg-text" x="35" y="140">Fix: fencing tokens. Lock service returns a monotonically increasing token (33, then 34). Storage rejects writes</text>
+<text class="svg-text" x="35" y="160">with a token lower than the highest it has seen. Client 1's write with token 33 is rejected after Client 2's 34.</text>
+<text class="svg-mono" x="35" y="178">Lesson: a lock without a fencing token + a store that checks it is not a safe lock. (Kleppmann vs Redlock)</text>
+</svg></div>
+
+<h3>Time & clocks</h3>
+<ul><li><b>Wall clocks (NTP)</b> drift and jump; never use them to order events across machines. "Last-write-wins by timestamp" silently loses data.</li><li><b>Monotonic clocks</b> for measuring durations on one machine.</li><li><b>Logical clocks:</b> Lamport timestamps (total order consistent with causality), <b>vector clocks</b> (detect concurrency: A→B, B→A, or concurrent).</li><li><b>TrueTime</b> (Google Spanner): GPS+atomic clocks give a bounded uncertainty interval; commit waits out the uncertainty → external consistency across the globe. Hardware, not magic.</li><li><b>Hybrid logical clocks</b> (CockroachDB): wall clock + logical counter.</li></ul>
+
+<!-- ============================================================ -->
+<h2>Asynchronous processing & message queues <span class="badge basic">basics</span></h2>
+<p>Not every piece of work needs to happen while the user waits. A <b>message queue</b> lets a producer hand off work and move on; <b>consumers</b> process it later at their own pace. This is the primary tool for <b>decoupling</b>, <b>absorbing bursts</b>, and <b>fan-out</b>.</p>
+<div class="diagram"><svg viewBox="0 0 900 260" width="900">
+<rect class="box" x="20" y="60" width="120" height="50"/><text class="svg-text" x="80" y="90" text-anchor="middle">Upload API</text>
+<rect class="box" x="20" y="130" width="120" height="50"/><text class="svg-text" x="80" y="160" text-anchor="middle">Upload API</text>
+<rect class="box q" x="260" y="80" width="260" height="80"/><text class="svg-text" x="390" y="105" text-anchor="middle">Queue / Topic: "video.uploaded"</text>
+<g class="svg-mono"><rect x="275" y="120" width="30" height="24" fill="#ffc857" rx="3"/><rect x="310" y="120" width="30" height="24" fill="#ffc857" rx="3"/><rect x="345" y="120" width="30" height="24" fill="#ffc857" rx="3"/><rect x="380" y="120" width="30" height="24" fill="#ffc857" opacity=".5" rx="3"/><rect x="415" y="120" width="30" height="24" fill="#ffc857" opacity=".3" rx="3"/></g>
+<rect class="box" x="650" y="20" width="130" height="44"/><text class="svg-text" x="715" y="47" text-anchor="middle">Transcoder ×20</text>
+<rect class="box" x="650" y="80" width="130" height="44"/><text class="svg-text" x="715" y="107" text-anchor="middle">Thumbnailer</text>
+<rect class="box" x="650" y="140" width="130" height="44"/><text class="svg-text" x="715" y="167" text-anchor="middle">Notifier</text>
+<rect class="box" x="650" y="200" width="130" height="44"/><text class="svg-text" x="715" y="227" text-anchor="middle">Analytics</text>
+<path class="wire" d="M140 85 L260 110"/><path class="wire" d="M140 155 L260 130"/>
+<path class="wire" d="M520 100 L650 42"/><path class="wire" d="M520 110 L650 102"/><path class="wire" d="M520 130 L650 162"/><path class="wire" d="M520 140 L650 222"/>
+<circle class="packet y" r="5"><animateMotion dur="1.2s" repeatCount="indefinite" path="M140 85 L260 110"/></circle>
+<circle class="packet y" r="5"><animateMotion dur="1.6s" repeatCount="indefinite" path="M140 155 L260 130"/></circle>
+<circle class="packet g" r="4"><animateMotion dur="2s" repeatCount="indefinite" path="M520 100 L650 42"/></circle>
+<circle class="packet g" r="4"><animateMotion dur="2.3s" repeatCount="indefinite" path="M520 110 L650 102"/></circle>
+<circle class="packet g" r="4"><animateMotion dur="1.8s" repeatCount="indefinite" path="M520 130 L650 162"/></circle>
+<circle class="packet g" r="4"><animateMotion dur="2.6s" repeatCount="indefinite" path="M520 140 L650 222"/></circle>
+<text class="svg-mono" x="20" y="235">API returns 202 Accepted in 20 ms instead of waiting 2 min for transcoding. Spike of 10k uploads → queue absorbs; consumers drain.</text>
+</svg></div>
+
+<h3>Patterns</h3>
+<ul><li><b>Work queue (point-to-point):</b> each message consumed by exactly one worker. Competing consumers scale horizontally. (RabbitMQ queues, SQS.)</li><li><b>Pub/sub (fan-out):</b> each message delivered to every subscriber group. (Kafka topics with consumer groups, SNS, Redis pub/sub.)</li><li><b>Event sourcing / log:</b> the queue <i>is</i> the source of truth; consumers rebuild state by replaying. (Kafka with long retention.)</li><li><b>CDC (change data capture):</b> tail the DB's binlog into a stream to update caches, search indexes, warehouses. (Debezium, Meta's Wormhole.)</li><li><b>Outbox pattern:</b> write the DB row and an "outbox" row in one transaction; a relay publishes outbox rows → no dual-write inconsistency.</li></ul>
+
+<h3>Kafka vs RabbitMQ (log vs broker) <span class="badge deep">deep dive</span></h3>
+<div class="compare">
+<div class="card"><h4>Kafka (distributed log)</h4><p>Topics split into <b>partitions</b>; each partition is an append-only, ordered log on disk, replicated (leader + ISR followers). Consumers track their own <b>offset</b> — messages aren't deleted on read (retention by time/size). Ordering guaranteed <i>within a partition</i> (choose partition key = user_id for per-user order). Throughput: millions msg/s via sequential I/O, zero-copy sendfile, batching. Consumer group: each partition → exactly one consumer in the group → <b>max parallelism = #partitions</b>. Replay possible. Great for streams, event sourcing, log pipelines.</p></div>
+<div class="card"><h4>RabbitMQ / SQS (smart broker)</h4><p>Broker pushes messages to consumers, tracks acks, deletes on ack, supports routing (exchanges, topics, headers), priorities, per-message TTL, delayed delivery. Lower throughput, richer semantics, simpler for task queues. No replay. SQS: fully managed, nearly infinite scale, at-least-once, visibility timeout, FIFO variant.</p></div>
+</div>
+
+<h3>Delivery semantics</h3>
+<table><tr><th>Guarantee</th><th>How</th><th>Cost</th></tr>
+<tr><td>At-most-once</td><td>Fire and forget; ack before processing</td><td>Messages may be lost. Metrics, logs where loss is OK.</td></tr>
+<tr><td>At-least-once</td><td>Ack after processing; redeliver on timeout</td><td>Duplicates on crash between process and ack → consumers MUST be idempotent. The default for everything important.</td></tr>
+<tr><td>Exactly-once</td><td>At-least-once + idempotent/transactional consumer (dedup by message id; Kafka transactions for Kafka→Kafka)</td><td>Expensive; really "effectively once". Don't promise it in an interview without explaining dedup.</td></tr></table>
+
+<h3>Operating queues</h3>
+<ul><li><b>Backpressure:</b> when consumers can't keep up, queue depth grows (lag). Alert on consumer lag. Options: scale consumers, shed load, bound the queue and reject producers (fail fast), or drop low-priority messages.</li><li><b>Poison messages & DLQ:</b> a message that always fails blocks retries forever. After N attempts, move to a <b>dead-letter queue</b> for inspection; alert on DLQ size.</li><li><b>Ordering vs parallelism:</b> strict global ordering = 1 partition = 1 consumer. Pick the narrowest key that needs ordering.</li><li><b>Retries with backoff</b> via delay queues / retry topics (retry-1m, retry-10m, retry-1h).</li><li><b>Hot partitions:</b> a partition key with skew (one giant customer) saturates one broker/consumer. Same fixes as hot shards.</li></ul>
+
+<!-- ============================================================ -->
+<h2>Resilience patterns: designing for failure <span class="badge pe">PE core</span></h2>
+<p>At scale, something is always broken. Disks fail at ~2–4%/year; with 10,000 disks that's one per day. The goal is not to prevent failure but to <b>contain</b> it so users don't notice.</p>
+
+<h3>Timeouts, retries, and backoff</h3>
+<div class="callout bad"><b>The #1 cause of cascading failures</b>Service A calls B with no timeout. B slows down. A's threads all block waiting on B. A runs out of threads and stops serving its <i>other</i> endpoints. A's callers pile up. The whole site goes down because one dependency got slow. <b>Every network call needs a timeout.</b></div>
+<ul><li><b>Timeouts:</b> set from the caller's p99 + margin; propagate deadlines (caller passes "you have 200 ms left") so downstream doesn't waste work.</li><li><b>Retries:</b> only for transient errors (timeouts, 503, connection reset), only for idempotent ops, with a <b>budget</b> (e.g., retries ≤ 10% of requests). Retrying a saturated service makes it worse: <b>retry storms</b> amplify load 2–3×.</li><li><b>Exponential backoff + jitter:</b> wait 100 ms, 200, 400, 800… capped, with randomness so clients don't synchronize.</li></ul>
+<div class="sim" data-sim="backoff"><div class="controls"><label style="flex-direction:row;gap:8px"><input type="checkbox" class="jit" checked> Add full jitter</label><button class="btn sm ghost re">Re-roll</button></div><div class="bars out"></div><p class="tag">Without jitter, 1000 clients that failed at the same moment all retry at the same moment — a synchronized wave. With jitter the retries are spread uniformly.</p></div>
+
+<h3>Circuit breaker</h3>
+<div class="diagram"><svg viewBox="0 0 900 190" width="900">
+<circle cx="150" cy="80" r="50" fill="#143d2c" stroke="#2fd48a" stroke-width="2"/><text class="svg-text" x="150" y="78" text-anchor="middle">CLOSED</text><text class="svg-mono" x="150" y="95" text-anchor="middle">requests flow</text>
+<circle cx="450" cy="80" r="50" fill="#3d1414" stroke="#ff5c7a" stroke-width="2"/><text class="svg-text" x="450" y="78" text-anchor="middle">OPEN</text><text class="svg-mono" x="450" y="95" text-anchor="middle">fail fast</text>
+<circle cx="750" cy="80" r="50" fill="#3d2a14" stroke="#ffc857" stroke-width="2"/><text class="svg-text" x="750" y="78" text-anchor="middle">HALF-OPEN</text><text class="svg-mono" x="750" y="95" text-anchor="middle">1 trial request</text>
+<path class="wire" d="M200 70 H400" marker-end="url(#ar2)"/><text class="svg-mono" x="300" y="60" text-anchor="middle">error rate &gt; 50% in 10s</text>
+<path class="wire" d="M500 70 H700" marker-end="url(#ar2)"/><text class="svg-mono" x="600" y="60" text-anchor="middle">after 30s cooldown</text>
+<path class="wire" d="M740 130 Q450 180 160 130" marker-end="url(#ar2)"/><text class="svg-mono" x="450" y="170" text-anchor="middle">trial succeeds → close</text>
+<path class="wire" d="M720 125 Q600 150 480 125" marker-end="url(#ar2)" stroke="#ff5c7a"/><text class="svg-mono" x="600" y="128" text-anchor="middle">trial fails → open</text>
+<defs><marker id="ar2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#5b8cff"/></marker></defs>
+</svg><div class="cap">Stop hammering a failing dependency; return a fallback immediately; probe occasionally to recover. Gives the dependency room to heal.</div></div>
+
+<h3>Rate limiting & load shedding</h3>
+<div class="sim" data-sim="token"><h4 style="margin-top:0">Token bucket rate limiter</h4>
+<div class="controls"><label>Bucket capacity (burst) = <span class="capv">10</span><input class="cap" type="range" min="1" max="30" value="10"></label><label>Refill rate (tokens/s) = <span class="ratev">2</span><input class="rate" type="range" min="1" max="20" value="2"></label><button class="btn sm req">Send 1 request</button><button class="btn sm ghost burst">Burst 15</button><button class="btn sm ghost auto">Auto traffic (5 rps)</button></div>
+<canvas width="560" height="220"></canvas><p class="tag">Each request takes one token; tokens refill at a steady rate. Bursts up to the bucket size are allowed; sustained rate is capped at the refill rate. Auto traffic at 5 rps with refill 2/s → ~60% rejected once the bucket drains.</p></div>
+<table><tr><th>Algorithm</th><th>Behavior</th><th>Notes</th></tr>
+<tr><td>Token bucket</td><td>Allows bursts up to capacity, average = refill rate</td><td>Most common (AWS, Stripe). 2 numbers per key — tiny memory.</td></tr>
+<tr><td>Leaky bucket</td><td>Requests queue and drain at constant rate</td><td>Smooths output; adds latency; used in network shaping.</td></tr>
+<tr><td>Fixed window</td><td>Count per minute</td><td>Simple; 2× burst at window edges (end of minute + start of next).</td></tr>
+<tr><td>Sliding window log</td><td>Store timestamps, count those within last N sec</td><td>Exact; memory grows with rate.</td></tr>
+<tr><td>Sliding window counter</td><td>Weighted blend of current and previous fixed windows</td><td>Good approximation, O(1) memory. Cloudflare's choice.</td></tr></table>
+<p><b>Distributed rate limiting:</b> counters in Redis (<code>INCR</code> + <code>EXPIRE</code>, or Lua for atomic token bucket); accept slight over-admission by syncing local counters periodically; or rate-limit at the gateway where there are few nodes. Return <code>429</code> with <code>Retry-After</code>.</p>
+<p><b>Load shedding</b> is rate limiting by the server for self-protection: when CPU/queue depth/latency crosses a threshold, reject the cheapest-to-reject requests first (low priority, unauthenticated, retries). Prefer failing 10% of requests fast over failing 100% slowly. Meta's "Adaptive concurrency / criticality-based shedding" is a frequent PE topic.</p>
+
+<h3>Bulkheads, isolation, and blast radius</h3>
+<ul><li><b>Bulkheads:</b> separate thread pools / connection pools / instances per dependency or per customer, so one misbehaving tenant can't exhaust shared resources.</li><li><b>Cell-based architecture:</b> partition the whole stack into independent cells (each with its own LB, services, DBs) serving a slice of users. A bad deploy or failure affects one cell (one-N-th of users). Used by AWS, Slack, Meta's regions.</li><li><b>Failure domains:</b> rack → row → datacenter → region. Spread replicas across domains; never put all 3 replicas in the same rack (one top-of-rack switch failure = outage).</li><li><b>Graceful degradation:</b> when recommendations are down, show the chronological feed. When search is down, show cached results. Define degraded modes up front.</li></ul>
+
+<h3>Redundancy & failover</h3>
+<table><tr><th>Pattern</th><th>Description</th><th>Trade-off</th></tr>
+<tr><td>Active–passive</td><td>Standby takes over on failure (VIP move, DNS switch)</td><td>Standby wastes capacity; failover takes seconds–minutes; "is the standby actually working?" risk</td></tr>
+<tr><td>Active–active</td><td>All nodes serve traffic; survivors absorb load</td><td>Must run at ≤ (N−1)/N utilization (N+1 or N+2 provisioning). Needs stateless or multi-master data.</td></tr>
+<tr><td>Multi-region</td><td>Full stack in multiple geographic regions</td><td>Latency wins + survives region loss; data replication consistency is the hard part; cost 2×+</td></tr>
+<tr><td>Disaster recovery</td><td>Backups + runbook to rebuild elsewhere</td><td><b>RPO</b> (recovery point objective: how much data you can lose) and <b>RTO</b> (recovery time objective: how long to restore). Test restores — a backup you've never restored is not a backup.</td></tr></table>
+
+<h3>Cascading failures: the full catalogue <span class="badge deep">deep dive</span></h3>
+<details class="reveal"><summary>Overload → slowness → retries → more overload (the death spiral)</summary><p>Server at 100% CPU gets slower → clients time out and retry → load doubles → everything times out. The system can stay down <i>even after the trigger is removed</i> (metastable failure). Fixes: load shedding, retry budgets, circuit breakers, and the ability to drop all traffic and ramp back up slowly.</p></details>
+<details class="reveal"><summary>Thundering herd on recovery</summary><p>Service comes back; every client reconnects at once; cache is cold; it falls over again. Fixes: jittered reconnects, slow-start traffic ramp at the LB, cache warming, connection rate limits.</p></details>
+<details class="reveal"><summary>Capacity loss from one failure (the N−1 problem)</summary><p>3 servers at 70% each; one dies; remaining two must take 105% → both die. Provision so losing a failure domain leaves you under 100%. "What's your headroom?" is a classic PE question.</p></details>
+<details class="reveal"><summary>Shared dependency outage</summary><p>Everything depends on auth / config / DNS / the service-discovery system → that dependency is the whole site's SPOF. Harden those few systems extremely, make clients cache their last good answer, and make startup not depend on them (static fallback). The 2021 Facebook outage: a config push withdrew BGP routes to the DNS servers → DNS down → everything down, including internal tools and door badges.</p></details>
+<details class="reveal"><summary>Bad deploy</summary><p>Most outages are caused by changes. Fixes: canary (1% of hosts), progressive rollout by region, automatic rollback on SLO regression, feature flags (decouple deploy from release), config changes treated as code with the same rollout discipline.</p></details>
+
+<!-- ============================================================ -->
+<h2>Service architecture: monolith, microservices, and the plumbing <span class="badge basic">basics</span></h2>
+<div class="compare">
+<div class="card"><h4>Monolith</h4><p>One deployable. Simple dev, debug, deploy; in-process calls are free and transactional. Scales fine for a long time (Meta's web tier is a giant PHP/Hack monolith!). Problems: team coupling, one bad change takes down everything, can't scale components independently, long builds.</p></div>
+<div class="card"><h4>Microservices</h4><p>Many small services over the network, each owned by a team, with its own DB. Independent deploy and scale, tech freedom, fault isolation (if done right). Costs: network latency & failures everywhere, distributed transactions, observability needs (tracing), operational burden ×N, versioned APIs. <b>Don't start with microservices.</b> Split when team size or scaling needs demand it.</p></div>
+</div>
+<h3>Supporting infrastructure</h3>
+<ul><li><b>API gateway:</b> single entry point handling auth, rate limiting, routing, TLS, request logging, protocol translation (REST → gRPC). (Kong, Envoy, AWS API Gateway.)</li><li><b>Service discovery:</b> how does A find B's current IPs? Client-side (query a registry like Consul/etcd/ZooKeeper, then LB locally) vs server-side (DNS or an LB in front). Health checks evict dead instances. Kubernetes Services do this via DNS + kube-proxy.</li><li><b>Service mesh:</b> a sidecar proxy (Envoy) next to each service handles mTLS, retries, timeouts, circuit breaking, metrics, tracing — uniformly, outside app code. (Istio, Linkerd; Meta uses a library approach — ServiceRouter.)</li><li><b>Configuration management:</b> centralized, versioned config with gradual rollout and instant rollback; clients subscribe for changes. Config errors cause as many outages as code — treat with the same care.</li><li><b>Containers & orchestration:</b> packaging (Docker) + scheduling/placement/healing/scaling (Kubernetes; Meta's Twine/Tupperware). The scheduler is a bin-packing + constraint solver: spread replicas across failure domains, respect CPU/mem requests, reschedule on node death.</li></ul>
+
+<!-- ============================================================ -->
+<h2>Storage systems at scale <span class="badge deep">deep dive</span></h2>
+<h3>Object / blob storage</h3>
+<p>Billions of immutable objects (photos, videos, backups) addressed by key, accessed via HTTP. Flat namespace, no in-place edits, massive scale, cheap. Design: a <b>metadata service</b> (key → location, sharded DB) + <b>storage nodes</b> holding bytes + replication or erasure coding. Writes go to several nodes; reads via any. Meta's <b>Haystack</b> packs many small photos into large append-only files to avoid per-file filesystem metadata overhead (one disk seek per photo instead of three); <b>f4</b> stores "warm" photos with erasure coding for lower replication cost.</p>
+<p><b>Erasure coding</b> (Reed-Solomon): split data into k chunks + m parity chunks; any k of k+m reconstruct the data. RS(10,4): 1.4× storage overhead tolerating 4 failures, vs 3× for triple replication. Cost: reconstruction reads k chunks (slow, network-heavy) → use for cold data; replicate hot data.</p>
+<h3>Distributed file systems (GFS / HDFS / Tectonic)</h3>
+<p>Files split into large chunks (64–256 MB), each replicated 3× across chunkservers. A <b>master/NameNode</b> holds the namespace and chunk locations in memory (metadata only — the bottleneck; HDFS federation and Tectonic shard it). Clients ask the master for locations, then read/write chunkservers directly. Optimized for large sequential reads and appends, not small random writes. Rack-aware placement: 2 replicas in one rack, 1 in another.</p>
+<h3>Search indexes</h3>
+<p>Inverted index: term → sorted posting list of doc IDs (+ positions). Query "cats AND dogs" = intersect two posting lists. Sharded by document; each query scatter-gathers across shards and merges top-k. Indexes built offline in batches or near-realtime via segments (Lucene). Relevance via TF-IDF/BM25 then ML re-ranking.</p>
+<h3>Data pipelines</h3>
+<p><b>Batch</b> (MapReduce/Spark on a data lake, hourly/daily): high throughput, high latency, easy reprocessing. <b>Stream</b> (Kafka + Flink/Spark Streaming): seconds latency, windowing, exactly-once via checkpoints; harder. <b>Lambda architecture:</b> both, merged at query time. <b>Kappa:</b> stream only, replay for batch. ETL: ingest → clean → store columnar (Parquet/ORC) → query (Presto/Trino, Hive, Spark SQL).</p>
+
+<!-- ============================================================ -->
+<h2>Observability, SLOs & operating systems in production <span class="badge pe">PE core</span></h2>
+<p>You cannot run what you cannot see. PE interviews heavily weight this. For every design, be ready to answer: <b>"how would you know it's broken, and how would you find out why?"</b></p>
+<h3>The three pillars</h3>
+<div class="grid">
+<div class="card"><h4>Metrics</h4><p>Numeric time-series: counters (requests_total), gauges (queue_depth), histograms (latency buckets → p50/p95/p99). Cheap, aggregatable, alertable. Prometheus/Graphite/ODS (Meta). Cardinality (label combinations) is the cost — never put user IDs in labels.</p></div>
+<div class="card"><h4>Logs</h4><p>Discrete events with context. Structured (JSON) → searchable. Expensive at scale (sample, tier, retain briefly). ELK, Splunk, Scribe/Scuba (Meta). Essential for "why did request X fail?"</p></div>
+<div class="card"><h4>Traces</h4><p>A request's path across services: span tree with timings. Propagate a trace ID in headers. Shows where latency goes in a microservice call graph. Jaeger, Zipkin, OpenTelemetry, Canopy (Meta). Sample (1–10%) to control volume.</p></div>
+</div>
+<h3>What to measure: the four golden signals (Google SRE)</h3>
+<ol><li><b>Latency</b> — distribution, not average; separate success vs error latency. p99 matters: at 100 calls per page, 63% of users hit a p99.</li><li><b>Traffic</b> — RPS, bandwidth, active connections.</li><li><b>Errors</b> — rate, by type (5xx, timeouts, wrong answers).</li><li><b>Saturation</b> — how full: CPU, memory, disk I/O, queue depth, connection pool usage. Predicts imminent failure.</li></ol>
+<p><b>USE method</b> (Brendan Gregg) for resources: Utilization, Saturation, Errors — for every CPU, disk, NIC, memory. <b>RED method</b> for services: Rate, Errors, Duration.</p>
+
+<h3>SLIs, SLOs, SLAs and error budgets</h3>
+<div class="sim" data-sim="avail"><h4 style="margin-top:0">Availability calculator</h4>
+<div class="controls"><label>Target<select><option value="0.99">99% (two nines)</option><option value="0.999" selected>99.9% (three nines)</option><option value="0.9995">99.95%</option><option value="0.9999">99.99% (four nines)</option><option value="0.99999">99.999% (five nines)</option></select></label><label>Components in series = <span class="chainv">3</span><input class="chain" type="range" min="1" max="10" value="3" style="width:150px"></label></div>
+<div class="out"></div><div class="comp" style="margin-top:10px"></div></div>
+<ul><li><b>SLI</b> (indicator): a measured ratio — "fraction of requests served under 300 ms with a 2xx". </li><li><b>SLO</b> (objective): the target — "99.9% over a 30-day window". Internal; drives engineering decisions.</li><li><b>SLA</b> (agreement): the contract with customers with penalties. Always looser than the SLO.</li><li><b>Error budget</b> = 1 − SLO. At 99.9%, you may be "bad" for 43 min/month. If the budget is healthy → ship faster; if burned → freeze features, work on reliability. This is how SRE resolves dev-vs-ops tension.</li><li><b>Burn-rate alerts:</b> alert when the budget is being consumed X× faster than sustainable (e.g., 14.4× over 1 h and 6× over 6 h) — far better than static "error rate > 1%" thresholds.</li></ul>
+
+<h3>Alerting philosophy</h3>
+<ul><li>Page on <b>symptoms</b> (users see errors/latency), not causes (CPU is high). Causes become dashboards.</li><li>Every page must be <b>actionable</b> and <b>urgent</b>. Otherwise: ticket, not page. Alert fatigue kills on-call.</li><li>Link every alert to a <b>runbook</b>: what it means, how to check, how to mitigate.</li><li>Alert on absence of data (the monitoring itself died) and on <b>saturation trends</b> (disk full in 4 h).</li></ul>
+
+<h3>Incident response & postmortems</h3>
+<div class="steps">
+<div class="step"><b>Detect</b> (alert or report) → <b>Triage</b> severity → <b>Declare</b> an incident, assign an Incident Commander (coordinates, doesn't debug), a comms lead, and ops leads.</div>
+<div class="step"><b>Mitigate first, root-cause later.</b> Roll back the last change (most outages are change-induced). Fail over. Shed load. Disable the feature flag. Restore service, then investigate.</div>
+<div class="step"><b>Communicate</b> on a status page / channel at fixed intervals even if nothing changed.</div>
+<div class="step"><b>Blameless postmortem:</b> timeline, impact (users, duration, SLO burn), root cause(s) using "5 whys", contributing factors, what went well, action items with owners. Blameless → people tell the truth → systems improve. Focus on <i>systemic</i> fixes (guardrails) not "be more careful".</div>
+</div>
+
+<h3>Deployments</h3>
+<table><tr><th>Strategy</th><th>How</th><th>Pros / cons</th></tr>
+<tr><td>Rolling</td><td>Replace instances a few at a time</td><td>No extra capacity needed; mixed versions coexist (APIs must be backward compatible)</td></tr>
+<tr><td>Blue-green</td><td>Spin up full new fleet (green), switch LB, keep blue for instant rollback</td><td>2× capacity briefly; clean switch; DB migrations still hard</td></tr>
+<tr><td>Canary</td><td>1% → 10% → 50% → 100%, comparing metrics against control at each stage</td><td>Catches most regressions with minimal blast radius; needs good metrics & automated analysis</td></tr>
+<tr><td>Feature flags</td><td>Deploy dark, enable per user/percent</td><td>Decouples deploy from release; instant kill switch; flag debt</td></tr></table>
+<p><b>Backward-compatible changes:</b> add columns/fields, never rename or remove in the same deploy (expand → migrate → contract). Both old and new code must work with both old and new data during the rollout.</p>
+
+<h3>Capacity planning</h3>
+<p>Forecast demand (growth trend + seasonality + launches) → translate to resources (QPS per core, GB per user) → provision with headroom for peak, N+1/N+2 for failure domains, and lead time for hardware (months). Load-test to find the real per-host capacity rather than guessing. Track utilization vs. forecast monthly. Know the difference between <b>provisioned</b>, <b>used</b>, and <b>needed-to-survive-a-region-loss</b>.</p>
+
+<!-- ============================================================ -->
+<h2>Security essentials <span class="badge basic">basics</span></h2>
+<ul><li><b>Authentication</b> (who are you) vs <b>authorization</b> (what may you do). Sessions (server-side, revocable) vs <b>JWT</b> (stateless, signed, hard to revoke → short expiry + refresh tokens). OAuth2/OIDC for delegated login. mTLS between services.</li><li><b>Passwords:</b> never store plaintext; salt + slow hash (bcrypt/argon2). Hashing ≠ encryption.</li><li><b>TLS everywhere;</b> terminate at the edge; re-encrypt internally in zero-trust networks. Certificates expire — the most common self-inflicted outage; automate renewal and monitor expiry.</li><li><b>Secrets management:</b> no secrets in code/config repos; use a vault with rotation and audit.</li><li><b>Input validation,</b> parameterized queries (SQL injection), output encoding (XSS), CSRF tokens, CORS.</li><li><b>DDoS:</b> absorb at the edge (anycast, CDN), SYN cookies, rate limits, prioritize authenticated traffic, scrubbing centers.</li><li><b>Least privilege,</b> network segmentation, audit logs, defense in depth.</li><li><b>Encryption at rest</b> for disks/backups; key management (KMS) separate from data.</li></ul>
+
+<!-- ============================================================ -->
+<h2>Self-test: system design rapid fire</h2>
+<div class="quiz">
+<div class="q"><b>Your DB is at 90% CPU from reads. First three things you'd do?</b><div class="ans">1) Find the slow/hot queries (slow log, <code>EXPLAIN</code>) and add indexes or fix N+1 patterns. 2) Add a cache (cache-aside, Redis) for hot reads. 3) Add read replicas and route reads to them (accepting lag; handle read-your-writes). Only then consider sharding.</div></div>
+<div class="q"><b>Why is consistent hashing better than hash mod N?</b><div class="ans">Adding/removing a node remaps only ~1/N of keys (just the neighbor's range) instead of nearly all keys, avoiding cache-miss storms and massive data movement. Virtual nodes fix load imbalance and spread a dead node's load across all others.</div></div>
+<div class="q"><b>What's the difference between availability and durability?</b><div class="ans">Availability: can I get an answer right now. Durability: once acknowledged, the data will never be lost. S3 is designed for 99.999999999% (11 nines) durability but 99.99% availability — you might not be able to read it right now, but it isn't gone.</div></div>
+<div class="q"><b>A client got a timeout on a POST /payments. Should it retry?</b><div class="ans">Only if the operation is idempotent. The server may have processed it. Use an idempotency key: the client sends the same key on retry; the server detects the duplicate and returns the original result instead of charging twice.</div></div>
+<div class="q"><b>Why W + R &gt; N gives consistency, and why it's not perfectly linearizable in practice?</b><div class="ans">Overlap guarantees at least one replica in the read set has the latest write. But: sloppy quorums, concurrent writes with clock-based LWW, partially failed writes (succeeded on 1 of W), and reads racing with in-flight writes can still return stale/inconsistent results. Dynamo-style systems are "mostly" consistent at W+R>N, not linearizable.</div></div>
+<div class="q"><b>Explain a cache stampede and two fixes.</b><div class="ans">Popular key expires → many simultaneous misses → DB overload. Fixes: request coalescing/leases (only one recomputes, others wait or get stale), probabilistic early expiration, stale-while-revalidate, jittered TTLs.</div></div>
+<div class="q"><b>Kafka: how do you get ordering AND parallelism?</b><div class="ans">Ordering is per partition. Choose a partition key that is the smallest unit needing order (user_id, not global). Parallelism = number of partitions; each consumer in a group owns some partitions. Increasing partitions later changes key→partition mapping (breaks ordering across the boundary) so over-provision partitions up front.</div></div>
+<div class="q"><b>What's a fencing token and why does a distributed lock need one?</b><div class="ans">A monotonically increasing number issued with each lock grant. The protected resource rejects writes with a token lower than the highest seen. Prevents a client that paused (GC, network) past its lease expiry from clobbering writes made by the next lock holder.</div></div>
+<div class="q"><b>Why page on symptoms rather than causes?</b><div class="ans">Causes are many and noisy (high CPU may be fine); symptoms (error rate, latency SLO burn) are what users feel and are exactly the things worth waking someone for. Cause-based signals belong on dashboards for diagnosis.</div></div>
+<div class="q"><b>Three servers at 70% utilization — are you safe to lose one?</b><div class="ans">No. Total work = 210% of one server; two survivors would need 105% each. Safe N+1 means each of 3 must run at ≤ 66%. For N+2 (lose two) ≤ 33%. This is why fleets look "underutilized".</div></div>
+<div class="q"><b>Give an example where eventual consistency is fine and one where it is not.</b><div class="ans">Fine: like counts, view counts, feed ordering, profile picture propagation. Not fine: account balance, inventory for the last item, username uniqueness, access revocation (removing someone's permission must be seen immediately).</div></div>
+<div class="q"><b>How does a circuit breaker differ from a retry with backoff?</b><div class="ans">Retry/backoff is per-request: keep trying, slower. A circuit breaker is per-dependency state: after enough failures, stop sending requests entirely (fail fast with fallback) and only probe periodically. It protects the failing dependency from load and protects you from waiting on it.</div></div>
+</div>
+
+<div class="footer-nav"><a href="index.html">← Home</a><a href="case-studies.html">Next: Case Studies →</a></div>
+</main></div>
+<script src="app.js"></script></body></html>

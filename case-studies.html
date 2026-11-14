@@ -1,0 +1,211 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Case Studies — PE Prep</title><link rel="stylesheet" href="styles.css"></head><body>
+<div class="layout"><aside class="sidebar"></aside>
+<main>
+<section class="hero"><h1>System Design Case Studies</h1><p class="lead">Each walkthrough follows the same 5-step framework you'll use in the interview: <b>Requirements → Estimation → High-level design → Deep dives → Failure modes & operations</b>. Infra-flavored cases (metrics, logs, config, deploys, scheduler) are marked <span class="badge pe">PE</span> — expect those at Meta.</p></section>
+
+<div class="callout"><b>The framework (memorize)</b>
+<ol style="margin:4px 0"><li><b>Clarify requirements</b> (3–5 min): functional (what it does), non-functional (scale, latency, consistency, availability, durability), out of scope. Ask about read/write ratio, data size, geographic distribution.</li><li><b>Estimate</b> (3 min): QPS, storage, bandwidth, memory. Say the implications out loud ("so one DB won't do").</li><li><b>High-level design</b> (10 min): boxes & arrows, API, data model/schema. Get a working system end to end before optimizing.</li><li><b>Deep dive</b> (15 min): the 2–3 hardest parts; the interviewer will steer. Trade-offs at every choice.</li><li><b>Wrap up</b> (5 min): bottlenecks, failure modes, monitoring, how you'd scale 10×, what you'd do differently.</li></ol></div>
+
+<!-- ============================================================ -->
+<h2>URL shortener (TinyURL)</h2>
+<h3>Requirements</h3><p><b>Functional:</b> create short URL for a long URL; redirect; optional custom alias & expiry. <b>Non-functional:</b> very low redirect latency, high availability (redirects must always work), read-heavy (100:1), links must not collide.</p>
+<h3>Estimation</h3><p>100M new URLs/month ≈ 40 writes/s; 100:1 → 4k reads/s (peak ~10k). Each record ~500 B → 50 GB/month → 3 TB over 5 years. Easily fits one DB with replicas; cache the hot 20%.</p>
+<h3>Design</h3>
+<div class="ascii">Client ──► LB ──► API servers (stateless) ──► Cache (Redis: short→long) ──► DB (short_code PK, long_url, user, created, expires)
+                                   │
+                                   └──► ID generator (for new codes)</div>
+<p><b>API:</b> <code>POST /shorten {long_url, alias?, ttl?} → {short}</code>; <code>GET /{short} → 301/302 Location: long_url</code>.</p>
+<h3>Deep dives</h3>
+<details class="reveal"><summary>Generating the short code</summary><p>7 chars of base62 = 62⁷ ≈ 3.5 trillion codes. Options: (a) <b>hash</b> MD5/SHA of the long URL, take first 7 chars — collisions possible, must check & re-salt; same URL → same code (dedupe bonus). (b) <b>Counter → base62</b>: a global counter (ZooKeeper-assigned ranges per server, or Snowflake IDs) encoded to base62 — no collisions, but sequential codes are guessable (add a shuffle or random offset). (c) <b>Pre-generated key service</b>: a service pre-fills a table of unused random keys; API servers grab batches. Recommended: (b) or (c).</p></details>
+<details class="reveal"><summary>301 vs 302</summary><p>301 (permanent): browser caches, never asks again → less load, but you lose analytics and can't change the target. 302 (temporary): every click hits you → analytics, updatable. Most shorteners use 302 for analytics.</p></details>
+<details class="reveal"><summary>Scaling & failures</summary><p>Reads: cache-aside with LRU; cache hit ratio ~90%+ since clicks follow a power law. DB: hash-partition by short code when > 1 node; replicas for HA. Rate-limit creation per user/IP to prevent abuse. Expiry: lazy delete on read + background sweeper. Monitoring: redirect p99 latency, 404 rate, cache hit ratio, DB replication lag, create API error rate.</p></details>
+
+<!-- ============================================================ -->
+<h2>Distributed rate limiter <span class="badge pe">PE</span></h2>
+<p><b>Requirements:</b> limit requests per client (user/IP/API key) to N per window; low latency overhead (<1 ms); accurate-ish across many API servers; highly available (fail open or closed? — decide: usually fail open for user-facing, closed for abuse-protection).</p>
+<div class="ascii">Client ──► API Gateway ──┬─► rate limiter middleware ──► Redis cluster (counters / token buckets, keyed by client id, sharded by key)
+                         │        │ allow → forward to service
+                         │        └ deny  → 429 + Retry-After + X-RateLimit-Remaining
+                         └─► Rules service (limits per tier, cached in memory, pushed on change)</div>
+<details class="reveal"><summary>Algorithm choice & atomicity</summary><p>Token bucket (burst + steady rate) or sliding-window counter. In Redis, make check-and-decrement atomic with a Lua script or <code>MULTI</code>; store <code>{tokens, last_refill}</code> per key with TTL. Sliding window: <code>INCR key:minute</code> + <code>EXPIRE</code>, weight previous window by overlap.</p></details>
+<details class="reveal"><summary>Distributed accuracy</summary><p>Centralized Redis = exact but adds a network hop and is a dependency. Alternative: each gateway node keeps local counters and syncs to Redis asynchronously every 100 ms — slight over-admission, near-zero latency, survives Redis outage. Or route the same client to the same gateway node (consistent hashing) so counters are local and exact.</p></details>
+<details class="reveal"><summary>Operations</summary><p>Metrics: allow/deny rate per rule, Redis latency, Redis availability. Fail-open flag. Hot keys (one abusive client) can hammer one Redis shard — replicate hot keys or shard by key+suffix. Rules live in config with gradual rollout.</p></details>
+
+<!-- ============================================================ -->
+<h2>Metrics & monitoring system (like Prometheus / Meta's ODS) <span class="badge pe">PE</span></h2>
+<p>This is the most PE-flavored design question and extremely likely. <b>Requirements:</b> collect metrics from 1M hosts, each emitting ~1k time series every 10 s; store 2 weeks raw, 1 year downsampled; query dashboards (p99 latency over last 6 h for service X) in <1 s; alert on rules within 1 min; must be more reliable than what it monitors.</p>
+<h3>Estimation</h3><p>1M hosts × 1k series = 1B active series. 1B / 10 s = 100M data points/s. Each point (timestamp + float) 16 B raw → 1.6 GB/s; with Gorilla compression (~1.4 B/point) ≈ 140 MB/s → 12 TB/day → 170 TB for 2 weeks. Way beyond one node: sharded ingestion & storage.</p>
+<div class="diagram"><svg viewBox="0 0 900 300" width="900">
+<rect class="box" x="20" y="30" width="110" height="40"/><text class="svg-text" x="75" y="55" text-anchor="middle">Host agent</text>
+<rect class="box" x="20" y="90" width="110" height="40"/><text class="svg-text" x="75" y="115" text-anchor="middle">Host agent</text>
+<rect class="box" x="20" y="150" width="110" height="40"/><text class="svg-text" x="75" y="175" text-anchor="middle">Host agent ×1M</text>
+<rect class="box hl" x="200" y="90" width="120" height="50"/><text class="svg-text" x="260" y="110" text-anchor="middle">Ingest gateway</text><text class="svg-mono" x="260" y="128" text-anchor="middle">validate, batch</text>
+<rect class="box q" x="380" y="90" width="120" height="50"/><text class="svg-text" x="440" y="110" text-anchor="middle">Kafka</text><text class="svg-mono" x="440" y="128" text-anchor="middle">partition by series</text>
+<rect class="box db" x="560" y="30" width="130" height="50"/><text class="svg-text" x="625" y="50" text-anchor="middle">TSDB shard (hot)</text><text class="svg-mono" x="625" y="68" text-anchor="middle">in-mem 26h, Gorilla</text>
+<rect class="box db" x="560" y="90" width="130" height="50"/><text class="svg-text" x="625" y="120" text-anchor="middle">TSDB shard</text>
+<rect class="box db" x="560" y="150" width="130" height="50"/><text class="svg-text" x="625" y="180" text-anchor="middle">TSDB shard</text>
+<rect class="box db" x="740" y="90" width="140" height="50"/><text class="svg-text" x="810" y="110" text-anchor="middle">Cold store (blob)</text><text class="svg-mono" x="810" y="128" text-anchor="middle">downsampled 1m/1h</text>
+<rect class="box" x="380" y="200" width="120" height="44"/><text class="svg-text" x="440" y="227" text-anchor="middle">Alert evaluator</text>
+<rect class="box" x="560" y="230" width="130" height="44"/><text class="svg-text" x="625" y="257" text-anchor="middle">Query service</text>
+<rect class="box" x="740" y="230" width="140" height="44"/><text class="svg-text" x="810" y="257" text-anchor="middle">Dashboards (Grafana)</text>
+<path class="wire" d="M130 50 L200 105"/><path class="wire" d="M130 110 H200"/><path class="wire" d="M130 170 L200 125"/><path class="wire anim" d="M320 115 H380"/>
+<path class="wire anim" d="M500 105 L560 55"/><path class="wire anim" d="M500 115 H560"/><path class="wire anim" d="M500 125 L560 175"/><path class="wire" d="M690 115 H740"/>
+<path class="wire" d="M500 222 L560 240"/><path class="wire" d="M690 252 H740"/><path class="wire" d="M625 200 V230"/>
+<circle class="packet" r="4"><animateMotion dur="2.5s" repeatCount="indefinite" path="M130 110 H320 H500 L560 55"/></circle>
+<circle class="packet" r="4"><animateMotion dur="2.5s" begin=".8s" repeatCount="indefinite" path="M130 50 L200 105 H500 L560 175"/></circle>
+<text class="svg-mono" x="20" y="285">Pull (Prometheus scrapes /metrics) vs push (agents send). Push scales to millions of hosts & short-lived jobs; pull makes "target down" detection trivial.</text>
+</svg></div>
+<details class="reveal"><summary>Data model & storage engine</summary><p>Series = metric name + label set (<code>http_requests_total{service="api",host="h123",status="500"}</code>) → series ID (hash). Points = (ts, value). Store per-series in time-ordered blocks. <b>Gorilla compression</b>: delta-of-delta timestamps (regular intervals → ~1 bit), XOR of consecutive floats (similar values → few bits) → 12× compression. Keep last 26 h in memory (serves 85%+ of queries), flush immutable 2 h blocks to disk/blob, build an inverted index label→series IDs for queries. Downsample older data (1 min, 1 h aggregates: min/max/avg/count/sum) via background jobs.</p></details>
+<details class="reveal"><summary>Sharding & hot spots</summary><p>Shard by hash(series ID) so a service's series spread out; queries fan out and merge. Alternative: shard by tenant/service for query locality but risk hot shards. Cardinality explosion (a label with user IDs) is the classic failure — enforce limits per metric at ingest, alert on series count growth.</p></details>
+<details class="reveal"><summary>Alerting</summary><p>Rules evaluated every 10–60 s against the query layer: <code>rate(errors[5m])/rate(requests[5m]) > 0.01 for 5m</code>. "for" duration avoids flapping. Alerts → Alertmanager: dedupe, group, silence, route to pager/Slack. Alert evaluator must be replicated (2 evaluators, dedupe) — monitoring that goes down with the outage is useless. Run it in a different failure domain from the systems it monitors; have a dead-man's-switch (an alert that always fires; if it stops, monitoring is broken).</p></details>
+<details class="reveal"><summary>Reliability</summary><p>Agents buffer locally during ingest outages (bounded, drop oldest). Kafka decouples ingest from storage so storage restarts don't lose data. Replicate each TSDB shard 2–3× (ingest writes to all, queries pick any). Ingest is at-least-once → storage dedupes by (series, ts). Prefer availability over consistency: a slightly late/missing point is fine; a down dashboard during an incident is not. Degraded mode: serve from any replica, allow partial query results with a warning.</p></details>
+
+<!-- ============================================================ -->
+<h2>Log aggregation pipeline (ELK / Scribe → Scuba) <span class="badge pe">PE</span></h2>
+<p><b>Requirements:</b> collect logs from 100k hosts (1 TB/day… or 1 PB/day at Meta scale), search by service/host/time/text within seconds for the last 7 days, retain 30–90 days cheaply, never block the application when logging.</p>
+<div class="ascii">app ──stdout/file──► local agent (Fluent Bit / Scribe daemon: tail, parse, buffer on disk, batch, compress)
+                           │
+                           ▼
+                     Kafka (topic per log type, partition by host-hash) ◄── backpressure buffer, 24h retention
+                     ├──► Indexer workers ──► Elasticsearch / hot search cluster (sharded by time: daily indices)
+                     ├──► Archiver ──► blob storage (compressed Parquet by hour) ──► Presto/Athena for ad-hoc
+                     └──► Stream processors (alerts on error patterns, metrics derived from logs)</div>
+<details class="reveal"><summary>Key decisions</summary><ul><li><b>Structured logging</b> (JSON with service, host, level, trace_id) → indexable fields; avoid regex at scale.</li><li><b>Time-based indices</b>: easy retention (drop old index), queries hit only relevant days. Hot/warm/cold tiers: SSD → HDD → blob.</li><li><b>Sampling</b>: keep 100% of errors, sample debug/info at 1–10% under load; dynamic sampling by error rate.</li><li><b>Agent must never block the app</b>: async, bounded disk buffer, drop with a counter when full; the dropped-count is itself a metric.</li><li><b>Security</b>: PII scrubbing at the agent; access control per index.</li></ul></details>
+<details class="reveal"><summary>Failure modes</summary><p>Indexer slower than ingest → Kafka lag grows (alert on lag), scale indexers; ES cluster red (shard unassigned) → queries fail: replicate shards, cap shards per node; a single host logging in a loop floods the pipeline → per-host rate limits at agent; disk full on agent host → bounded buffer. Monitor: ingest rate, end-to-end delay (log timestamp vs index time), drop counts, query latency.</p></details>
+
+<!-- ============================================================ -->
+<h2>Configuration distribution / feature flags <span class="badge pe">PE</span></h2>
+<p><b>Requirements:</b> push a config change (e.g., a feature flag, a rate-limit value, a kill switch) to 1M hosts within seconds; versioned with rollback; gradual rollout (1% → 100%); hosts must start and run even if the config service is down; audit who changed what.</p>
+<div class="ascii">Engineer ──► Config UI/CLI ──► Config service (validate schema, store versioned in Git/DB, canary %) ──► Pub/sub "config changed v123"
+                                                                      │                                   │
+                                                                      ▼                                   ▼
+                                           Distribution tier (regional caches / CDN-like, serve by version)  ──► host agent (long-poll or watch)
+                                                                                                                  │ writes /etc/config/app.json atomically (write tmp + rename)
+                                                                                                                  │ keeps last-known-good on disk
+                                                                                                                  ▼
+                                                                                                              application (inotify / periodic reload / SIGHUP)</div>
+<details class="reveal"><summary>Why this is hard</summary><ul><li><b>Thundering herd:</b> 1M hosts fetching simultaneously after a change → regional caches, jitter, serve immutable versions by content hash so caches/CDN work.</li><li><b>Bad config = outage</b> (Facebook 2021, Cloudflare 2019 regex). Validate schema, dry-run, canary to a small % and auto-rollback on SLO regression. Treat config like code: review, versioning, instant revert.</li><li><b>Bootstrapping:</b> hosts must boot without the service — bake a default + last-known-good on disk.</li><li><b>Consistency:</b> all hosts won't see v123 at the same instant; design features to tolerate mixed versions for a few seconds (or coordinate via epochs if needed).</li><li><b>Watch vs poll:</b> ZooKeeper/etcd watches for small fleets; for millions, long-poll to a distribution tier with ETags.</li></ul></details>
+
+<!-- ============================================================ -->
+<h2>Deployment system (push code to 100k hosts) <span class="badge pe">PE</span></h2>
+<p><b>Requirements:</b> deploy a new binary/container to a service's fleet with zero downtime; staged rollout with automatic health gates; fast rollback; parallelism limits so capacity never drops below N−1; auditable.</p>
+<div class="ascii">CI builds artifact v42 ──► artifact store (blob, content-addressed, replicated per region; P2P/BitTorrent-style distribution for large fleets)
+          │
+          ▼
+Deploy orchestrator (state machine per rollout: canary 1% → 10% → 50% → 100%, per-region/per-failure-domain ordering)
+          │  for each batch (≤ 5% of hosts, never two from the same shard/rack):
+          │     1. drain from LB (fail health check / deregister), wait for in-flight to finish
+          │     2. stop old, pull artifact (pre-fetched), start new, run smoke test
+          │     3. re-register, wait for healthy + bake time (10 min) comparing canary metrics vs baseline
+          │     4. any SLO regression → halt + auto-rollback (previous artifact still on disk → seconds)
+          ▼
+Host agent executes steps, reports status; orchestrator persists state so it survives its own restart</div>
+<details class="reveal"><summary>Discussion points</summary><ul><li>Artifact distribution at scale: 1 GB × 100k hosts = 100 TB → regional caches + peer-to-peer (Meta, Uber's Kraken, Facebook's early BitTorrent use).</li><li>Health gates: not just "process up" — compare error rate/latency of new vs old cohort (canary analysis). Statistical: enough traffic to be meaningful.</li><li>Schema migrations and backward compatibility across mixed versions.</li><li>Rollback must be a first-class, tested, one-click action; keep N previous versions on disk.</li><li>Orchestrator HA: leader-elected, state in a durable store, idempotent steps (a retry after crash must not double-restart).</li><li>Emergency "break glass" path that skips stages, with audit.</li></ul></details>
+
+<!-- ============================================================ -->
+<h2>Distributed job scheduler / cron <span class="badge pe">PE</span></h2>
+<p><b>Requirements:</b> run millions of scheduled jobs (cron expressions, one-offs, delayed tasks), each executed <b>at least once</b> (ideally exactly once), on time (±seconds), with retries, dependencies, and visibility; survive scheduler failures.</p>
+<div class="ascii">Job definitions (DB: id, schedule, payload, retry policy, owner)
+        │
+Scheduler leaders (sharded by job-id hash; each shard has a Raft/ZK-elected leader) ─ scans "next_run ≤ now" (index on next_run) every second
+        │ enqueue (job_id, run_id, scheduled_ts) ──► Kafka / priority queue (per-priority topics)
+        ▼
+Workers (pull, claim run_id with lease in DB → CAS to RUNNING, heartbeat, exec, mark DONE/FAILED, schedule retry with backoff)
+        │
+Dead-letter after N failures ──► alerts; UI shows run history, logs, durations</div>
+<details class="reveal"><summary>Hard parts</summary><ul><li><b>Exactly-once execution:</b> leader election avoids double-scheduling; worker claim via compare-and-swap avoids double-run; jobs themselves should be idempotent because leases can expire mid-run (worker GC pause) — fencing token = run_id.</li><li><b>Clock skew:</b> use the DB/leader's clock, not workers'. Missed runs after downtime: catch-up policy (run once vs run all missed vs skip).</li><li><b>Hot second:</b> many jobs scheduled at :00 → jitter, spread, priority queues.</li><li><b>Dependencies (DAGs):</b> Airflow-style; a job's trigger is "all parents DONE".</li><li><b>Isolation:</b> a runaway job shouldn't starve others — per-tenant quotas, resource limits (cgroups), timeouts.</li></ul></details>
+
+<!-- ============================================================ -->
+<h2>News feed (Facebook / Twitter timeline)</h2>
+<p><b>Requirements:</b> post → appears in followers' feeds within seconds; feed load p99 < 500 ms; 2B users, 500M DAU, avg 300 friends, celebrities with 100M followers; ranked (not just chronological).</p>
+<div class="diagram"><svg viewBox="0 0 900 290" width="900">
+<rect class="box" x="20" y="40" width="100" height="44"/><text class="svg-text" x="70" y="67" text-anchor="middle">Poster</text>
+<rect class="box hl" x="180" y="40" width="120" height="44"/><text class="svg-text" x="240" y="67" text-anchor="middle">Post service</text>
+<rect class="box db" x="180" y="110" width="120" height="44"/><text class="svg-text" x="240" y="137" text-anchor="middle">Posts DB</text>
+<rect class="box q" x="360" y="40" width="110" height="44"/><text class="svg-text" x="415" y="67" text-anchor="middle">Fan-out queue</text>
+<rect class="box" x="530" y="40" width="130" height="44"/><text class="svg-text" x="595" y="60" text-anchor="middle">Fan-out workers</text><text class="svg-mono" x="595" y="76" text-anchor="middle">get followers, push</text>
+<rect class="box cache" x="720" y="30" width="160" height="64"/><text class="svg-text" x="800" y="52" text-anchor="middle">Feed cache (Redis)</text><text class="svg-mono" x="800" y="70" text-anchor="middle">user_id → [post_ids ×500]</text><text class="svg-mono" x="800" y="84" text-anchor="middle">sorted set by time/score</text>
+<rect class="box db" x="530" y="110" width="130" height="44"/><text class="svg-text" x="595" y="137" text-anchor="middle">Social graph (TAO)</text>
+<rect class="box" x="20" y="200" width="100" height="44"/><text class="svg-text" x="70" y="227" text-anchor="middle">Reader</text>
+<rect class="box hl" x="180" y="200" width="120" height="44"/><text class="svg-text" x="240" y="227" text-anchor="middle">Feed service</text>
+<rect class="box" x="360" y="200" width="110" height="44"/><text class="svg-text" x="415" y="220" text-anchor="middle">Ranker (ML)</text><text class="svg-mono" x="415" y="236" text-anchor="middle">hydrate + score</text>
+<path class="wire" d="M120 62 H180"/><path class="wire" d="M240 84 V110"/><path class="wire anim" d="M300 62 H360"/><path class="wire anim" d="M470 62 H530"/><path class="wire" d="M595 84 V110"/><path class="wire anim" d="M660 62 H720"/>
+<path class="wire" d="M120 222 H180"/><path class="wire" d="M300 222 H360"/><path class="wire" d="M240 200 Q 500 120 720 80" stroke-dasharray="4 4"/><text class="svg-mono" x="420" y="150">read: fetch ids from feed cache</text>
+<path class="wire" d="M300 212 Q 420 180 530 140" stroke-dasharray="4 4"/><text class="svg-mono" x="320" y="185">+ pull celebrities' recent posts live</text>
+<circle class="packet" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M120 62 H300 H470 H660 H720"/></circle>
+<text class="svg-mono" x="20" y="275">Write path (fan-out on write) for normal users; read path merges in celebrity posts (fan-out on read). Hybrid.</text>
+</svg></div>
+<details class="reveal"><summary>Fan-out on write vs fan-out on read</summary><table><tr><th></th><th>Fan-out on write (push)</th><th>Fan-out on read (pull)</th></tr><tr><td>Post</td><td>Write post_id into each follower's feed cache (300 writes)</td><td>Just store the post</td></tr><tr><td>Read feed</td><td>Read one precomputed list — fast</td><td>Query all followees' recent posts, merge, sort — slow, N queries</td></tr><tr><td>Celebrity w/ 100M followers</td><td>100M writes per post — too slow & wasteful (most are inactive)</td><td>Fine</td></tr><tr><td>Inactive users</td><td>Wasted work</td><td>No waste</td></tr></table><p><b>Hybrid:</b> push for users with < ~10k followers; pull for celebrities (merge at read time); skip pushing to users inactive > 30 days (rebuild on login). This is what Twitter/Instagram do.</p></details>
+<details class="reveal"><summary>Other dives</summary><ul><li>Feed cache sizing: 500M DAU × 500 ids × 8 B = 2 TB → fine across a Redis cluster.</li><li>Ranking: candidate posts (ids) → hydrate (posts, authors, counts from caches) → ML score → re-sort → paginate with cursor (not offset).</li><li>Media: images/video in blob storage + CDN; feed carries URLs.</li><li>Consistency: eventual is fine; your own post should appear immediately (insert into own feed synchronously).</li><li>Deletes/privacy: filter at read time (check post still exists & visible) rather than deleting from 100M feeds.</li></ul></details>
+
+<!-- ============================================================ -->
+<h2>Chat / messaging (WhatsApp, Messenger)</h2>
+<p><b>Requirements:</b> 1:1 and group messages, delivered in <100 ms when online, stored for offline delivery, ordering within a conversation, delivery/read receipts, presence, end-to-end encryption (optional), 1B users, 100B messages/day.</p>
+<div class="ascii">Mobile ◄──WebSocket (persistent)──► Chat gateway (stateful: holds connections; 1M conns/box; sharded by user)
+                                           │  user → gateway mapping in a session store (Redis)
+                                           ▼
+                                    Message service ──► Message store (Cassandra/HBase: partition=conversation_id, cluster by message_id/time)
+                                           │                 ids: Snowflake (time-ordered) per conversation; sequence number per conversation for ordering
+                                           ├──► look up recipient's gateway → push; if offline → store + push notification (APNs/FCM) via notification service
+                                           └──► Group: fan out to members (small groups push; huge groups pull from the conversation log)
+Presence service: heartbeats every 30s → last_seen; subscribe to friends' presence (pub/sub), debounce flapping</div>
+<details class="reveal"><summary>Deep dives</summary><ul><li><b>Why WebSockets:</b> server push without polling; one connection per device. Gateway is stateful — on gateway failure clients reconnect (jittered) and re-sync from last received message id.</li><li><b>Ordering:</b> per-conversation sequence numbers assigned by the message service (single writer per conversation via partitioning) — clients sort by seq, detect gaps, request missing.</li><li><b>Delivery guarantees:</b> at-least-once with client-side dedupe by message id; receipts are messages too (sent → delivered → read).</li><li><b>Storage:</b> write-heavy, read recent → LSM wide-column store partitioned by conversation; TTL/archival for old messages; E2E encryption means server stores ciphertext.</li><li><b>Scale:</b> 100B msgs/day ≈ 1.2M/s; each ~100 B → 12 TB/day. Gateways: 1B users, ~30% online → 300M connections / 1M per box = 300+ gateway hosts (+ headroom).</li></ul></details>
+
+<!-- ============================================================ -->
+<h2>Notification service</h2>
+<p>Send push (APNs/FCM), SMS, email to users from many internal producers; respect user preferences & rate limits (no more than N/day); dedupe; retry on provider failure; track delivery; 10M+/min bursts (e.g., breaking news).</p>
+<div class="ascii">Producers ──► Notification API (validate, template, check prefs/opt-outs, dedupe key) ──► Kafka (topic per channel, priority topics)
+   ──► Workers per channel (rate-limited per provider; batch for email) ──► Providers (APNs/FCM/Twilio/SES) with circuit breakers & failover to secondary provider
+   ──► Delivery receipts → status store; retries with backoff → DLQ; analytics; user-facing "notification center" store</div>
+<p><b>Key points:</b> idempotency key to avoid duplicate sends on retries; priority lanes so OTP codes aren't stuck behind marketing blasts; per-user rate limiting/aggregation ("5 people liked your post"); provider quotas; templating & localization; quiet hours.</p>
+
+<!-- ============================================================ -->
+<h2>Web crawler</h2>
+<p>Crawl billions of pages, politely (robots.txt, per-domain rate limits), prioritizing fresh/important pages, avoiding duplicates and traps, storing content for indexing.</p>
+<div class="ascii">Seed URLs ──► URL Frontier (priority queues by importance + per-host queues enforcing politeness delay; backed by Redis/disk)
+    ──► Fetchers (async I/O, thousands of concurrent connections; DNS cache; robots.txt cache) ──► Content store (blob)
+    ──► Parser/extractor ──► URL filter (normalize, dedupe via Bloom filter / URL-seen DB, domain allowlist) ──► back to Frontier
+    ──► Content dedupe (SimHash / MinHash for near-duplicates) ──► Indexer</div>
+<p><b>Dives:</b> politeness = one connection per host at a time, delay between fetches; frontier partitioned by host hash so a host maps to one fetcher; trap detection (infinite calendars, URL length limits, depth limits); freshness via recrawl schedule based on change frequency; distributed across DCs with consistent-hashed URL ownership; monitor fetch rate, error rates per domain, frontier size.</p>
+
+<!-- ============================================================ -->
+<h2>Distributed cache (design Memcached/Redis cluster)</h2>
+<p>get/set/delete with sub-ms latency, 10M+ QPS, 100 TB across nodes, tolerate node loss, minimize remapping on topology change.</p>
+<div class="ascii">Client library (or proxy like mcrouter/twemproxy): consistent hashing w/ vnodes → node; connection pooling; local L1 cache for hot keys; request batching (multi-get)
+Nodes: slab allocator (memcached) / jemalloc (redis), LRU per slab class, single-threaded event loop or multi-threaded workers, no disk
+Cluster: gossip for membership + failure detection; replicas (warm standby or N copies w/ async replication); hot-key detection & replication; consistent hash ring maintained by clients from a config service</div>
+<p><b>Dives:</b> Meta's <b>mcrouter</b> handles routing, pools, failover (gutter pool for dead nodes), replication to regions, and "lease" semantics against stampedes. Discuss: eviction, TTL, memory fragmentation, big values, network as the bottleneck (10 Gbps ≈ 1.25 GB/s; 1 KB values → ~1M ops/s per NIC), incast congestion from huge multi-gets (many servers reply simultaneously → switch buffer overflow — fix: sliding window on client).</p>
+
+<!-- ============================================================ -->
+<h2>File storage & sync (Dropbox / Google Drive)</h2>
+<p>Upload/download files up to GBs, sync across devices, versioning, sharing, 500M users × 10 GB.</p>
+<div class="ascii">Client: chunk file into 4 MB blocks → hash each (SHA-256) → ask metadata service which blocks are new → upload only those (dedupe + delta sync) → commit new file version
+Block service ──► object storage (blocks addressed by hash, replicated/erasure-coded)
+Metadata service (DB: files, versions, block lists, sharing ACLs; sharded by user/namespace) ──► notification service (long-poll) tells other devices "changed" → they fetch metadata + missing blocks
+Conflicts: last-writer wins + keep "conflicted copy"; offline queue on client</div>
+<p><b>Dives:</b> content-addressed blocks give dedupe across users; resumable uploads; metadata is the hot path (strong consistency, SQL); blob is the cheap path; CDN for popular shared files; client watches FS with inotify/FSEvents; rate-limiting sync storms.</p>
+
+<!-- ============================================================ -->
+<h2>Video platform (YouTube)</h2>
+<div class="ascii">Upload ──► blob (raw) ──► transcode pipeline (queue → workers: multiple resolutions/codecs, split into 2–10s segments, DAG of tasks) ──► CDN origin
+Playback: manifest (HLS/DASH) → client picks bitrate adaptively → segments from CDN edge (99% hit) ; metadata (title, views) in DB + cache; view counts via async aggregation (not synchronous DB increments)</div>
+<p><b>Dives:</b> transcoding is CPU-heavy and parallel per segment; pre-signed upload URLs straight to blob storage (don't proxy through app servers); CDN cost dominates; popular videos pre-pushed to edge; long-tail served from origin; recommendations are a separate ML system; counts use approximate/batched updates.</p>
+
+<!-- ============================================================ -->
+<h2>Practice prompts (do these on paper, 35 min each)</h2>
+<div class="checklist">
+<label><input type="checkbox" data-k="p1"><span>Design a system to collect and alert on metrics from 1M hosts.</span></label>
+<label><input type="checkbox" data-k="p2"><span>Design a service to distribute a 2 GB file to 200k servers in 10 minutes.</span></label>
+<label><input type="checkbox" data-k="p3"><span>Design a global DNS-based load balancing + health checking system.</span></label>
+<label><input type="checkbox" data-k="p4"><span>Design a system that stores every HTTP request log for 30 days and supports "show me all 5xx for host X in the last hour".</span></label>
+<label><input type="checkbox" data-k="p5"><span>Design a key-value store that survives the loss of a datacenter.</span></label>
+<label><input type="checkbox" data-k="p6"><span>Design a secrets/certificate distribution system with automatic rotation.</span></label>
+<label><input type="checkbox" data-k="p7"><span>Design a distributed cron that runs 10M jobs/day with exactly-once semantics.</span></label>
+<label><input type="checkbox" data-k="p8"><span>Design a URL shortener. Now make it survive a region outage. Now make redirects < 10 ms globally.</span></label>
+<label><input type="checkbox" data-k="p9"><span>Design a service-discovery system for 100k services with sub-second propagation of instance health.</span></label>
+<label><input type="checkbox" data-k="p10"><span>Design a system to detect and mitigate a DDoS attack on the edge.</span></label>
+</div>
+
+<div class="footer-nav"><a href="system-design.html">← System Design</a><a href="os.html">Next: Operating Systems →</a></div>
+</main></div>
+<script src="app.js"></script></body></html>

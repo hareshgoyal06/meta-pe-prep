@@ -1,0 +1,155 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Networking — PE Prep</title><link rel="stylesheet" href="styles.css"></head><body>
+<div class="layout"><aside class="sidebar"></aside>
+<main>
+<section class="hero"><h1>Networking</h1><p class="lead">From the wire to HTTP/3. The anchor question — <b>"what happens when you type a URL and press Enter?"</b> — touches every layer; by the end you'll be able to go 45 minutes deep on it. Start with the layer model, then the animated TCP walkthrough.</p></section>
+
+<h2>The layer model <span class="badge basic">basics</span></h2>
+<div class="diagram"><svg viewBox="0 0 900 330" width="900">
+<g class="svg-text">
+<rect x="20" y="20" width="200" height="44" fill="#2a1a3a" stroke="#ff6ad5" rx="6"/><text x="120" y="47" text-anchor="middle">7 Application</text><text x="240" y="47" class="svg-mono">HTTP, DNS, TLS*, SSH, SMTP, gRPC — data: messages</text>
+<rect x="20" y="70" width="200" height="44" fill="#1a2a3a" stroke="#38d9f5" rx="6"/><text x="120" y="97" text-anchor="middle">4 Transport</text><text x="240" y="97" class="svg-mono">TCP (reliable stream, ports), UDP (datagrams), QUIC — segments</text>
+<rect x="20" y="120" width="200" height="44" fill="#1a3a2a" stroke="#2fd48a" rx="6"/><text x="120" y="147" text-anchor="middle">3 Network</text><text x="240" y="147" class="svg-mono">IP (addressing, routing across networks), ICMP, BGP/OSPF — packets</text>
+<rect x="20" y="170" width="200" height="44" fill="#3a2a1a" stroke="#ffc857" rx="6"/><text x="120" y="197" text-anchor="middle">2 Data link</text><text x="240" y="197" class="svg-mono">Ethernet, Wi-Fi, ARP, MAC addresses, switches, VLANs — frames</text>
+<rect x="20" y="220" width="200" height="44" fill="#3a1a1a" stroke="#ff5c7a" rx="6"/><text x="120" y="247" text-anchor="middle">1 Physical</text><text x="240" y="247" class="svg-mono">Copper, fiber, radio — bits</text>
+</g>
+<text class="svg-mono" x="20" y="300">OSI has 7 layers (5 session, 6 presentation are mostly folded into 7 in TCP/IP). Each layer wraps the one above: [Eth [IP [TCP [HTTP…]]]]</text>
+<text class="svg-mono" x="20" y="318">Switches work at L2 (MAC), routers at L3 (IP), L4 LBs at TCP, L7 LBs at HTTP. "*TLS sits between 4 and 7."</text>
+</svg></div>
+<h3>Encapsulation</h3>
+<div class="ascii">| Ethernet header (dst MAC, src MAC, type) | IP header (src IP, dst IP, TTL, proto) | TCP header (src port, dst port, seq, ack, flags, window) | HTTP payload | Eth FCS |
+|◄──────── 14 B ────────►|◄──────── 20 B ──────►|◄──────────────── 20 B ────────────────►|◄ ≤1460 B (MSS) ►|  4 B  |
+MTU 1500 B = IP packet max on Ethernet. Bigger → fragmentation (or dropped if DF set → "PMTU blackhole"). Jumbo frames 9000 B inside datacenters.</div>
+
+<h2>IP addressing, subnets & routing <span class="badge basic">basics</span></h2>
+<p>IPv4: 32-bit, dotted quad. A <b>subnet</b> is a range sharing a prefix; <b>CIDR</b> <code>/24</code> = first 24 bits are network. Hosts in the same subnet talk directly (via ARP + switch); otherwise send to the <b>default gateway</b> (router).</p>
+<div class="sim" data-sim="subnet"><h4 style="margin-top:0">CIDR calculator</h4><div class="controls"><input type="text" value="10.1.20.0/22" style="width:200px"></div><div class="out"></div><p class="tag">Try /32 (single host), /31 (point-to-point), /16, /8. Private ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16. Loopback 127.0.0.0/8. Link-local 169.254/16 (APIPA — "I didn't get DHCP").</p></div>
+<ul><li><b>Routing table</b> (<code>ip route</code>): longest-prefix match wins. <code>default via 10.0.0.1 dev eth0</code> catches everything else.</li><li><b>TTL</b> decremented per hop; 0 → ICMP Time Exceeded (how traceroute works: TTL 1, 2, 3…).</li><li><b>ICMP:</b> ping (echo), destination unreachable, fragmentation needed (PMTU discovery — don't block ICMP entirely!).</li><li><b>NAT:</b> router rewrites private src IP:port → public IP:port and keeps a table (conntrack). Enables many hosts behind one IPv4. Breaks inbound connections (needs port forwarding / hole punching). <b>SNAT/masquerade</b> (outbound), <b>DNAT</b> (inbound, load balancers, Kubernetes services).</li><li><b>IPv6:</b> 128-bit, no NAT needed, SLAAC, Meta's internal network is IPv6-only.</li><li><b>Inside a datacenter:</b> Clos/leaf-spine fabric; ECMP spreads flows across equal-cost paths (hash of 5-tuple → path; one elephant flow can't be split). BGP within the DC (Meta/FB style) or OSPF.</li><li><b>Between networks:</b> <b>BGP</b> — autonomous systems announce prefixes to peers; path selection by policy, then shortest AS path. Withdrawing your prefixes = you disappear from the internet (Facebook, Oct 2021). Anycast = announce the same prefix from many places.</li></ul>
+
+<h2>Layer 2: Ethernet, ARP, switches <span class="badge basic">basics</span></h2>
+<ul><li><b>MAC address:</b> 48-bit, per NIC, local-segment only; rewritten at every router hop (IP stays the same).</li><li><b>ARP:</b> "Who has 10.0.0.5? Tell 10.0.0.7" broadcast → reply with MAC; cached (<code>ip neigh</code>). Gratuitous ARP announces a moved IP (VIP failover with keepalived). ARP spoofing = MITM.</li><li><b>Switch:</b> learns MAC→port from source addresses; forwards frames only to the right port (floods unknown). <b>VLANs</b> segment one physical switch into isolated L2 domains (802.1Q tag). Broadcast domains = one subnet typically.</li><li><b>Spanning tree</b> prevents L2 loops (slow convergence; modern DCs avoid L2 across racks — L3 to the rack).</li><li><b>DHCP:</b> Discover → Offer → Request → Ack (broadcast; relay agents across subnets). Gives IP, mask, gateway, DNS, lease time, PXE boot server.</li></ul>
+
+<h2>TCP in depth <span class="badge basic">basics</span> → <span class="badge deep">deep dive</span></h2>
+<div class="sim" data-sim="tcp"><h4 style="margin-top:0">TCP lifecycle walkthrough</h4><div class="controls"><button class="btn sm next">Next →</button><button class="btn sm ghost reset">Reset</button></div><canvas width="760" height="360"></canvas><div class="step-text card"></div></div>
+<h3>Header fields that matter</h3>
+<ul><li><b>Ports</b> (16-bit): identify the application; well-known &lt;1024 (need root/CAP_NET_BIND_SERVICE). A connection = 4-tuple (src IP, src port, dst IP, dst port).</li><li><b>Sequence / acknowledgment numbers:</b> byte offsets; provide ordering & reliability. ACK n = "I have everything before n".</li><li><b>Flags:</b> SYN (start), ACK, FIN (polite close), RST (abort — "nothing listening" or protocol violation), PSH, URG.</li><li><b>Window:</b> receiver's free buffer → <b>flow control</b> (don't overwhelm the receiver). Window scaling option for >64 KB.</li><li><b>Options:</b> MSS, SACK (selective ACK — retransmit only lost segments), timestamps, window scale.</li></ul>
+<h3>Connection states</h3>
+<div class="ascii">CLIENT                                  SERVER
+CLOSED ──SYN──►                         LISTEN ──► SYN-RECV (in SYN queue; SYN cookies if flooded)
+SYN-SENT ◄──SYN+ACK──
+ESTABLISHED ──ACK──►                    ESTABLISHED (moved to accept queue; app calls accept())
+   ... data both ways ...
+FIN-WAIT-1 ──FIN──►                     CLOSE-WAIT  (app must call close(); stuck here = app leak)
+FIN-WAIT-2 ◄──ACK──
+           ◄──FIN──                     LAST-ACK
+TIME-WAIT  ──ACK──►                     CLOSED
+(waits 2×MSL = 60s on Linux so late packets don't hit a new connection reusing the 4-tuple;
+ the side that closes FIRST pays TIME-WAIT → servers that close first accumulate thousands; usually harmless)</div>
+<h3>Reliability & congestion control</h3>
+<ul><li><b>Retransmission:</b> on RTO timeout (min 200 ms on Linux — a huge tail-latency hit) or on 3 duplicate ACKs (fast retransmit). SACK makes recovery efficient.</li><li><b>Congestion window (cwnd):</b> the sender's self-imposed limit, inferred from loss/delay. <b>Slow start</b> (exponential from initcwnd=10 segments) → <b>congestion avoidance</b> (linear) → on loss: halve (Reno/CUBIC) → <b>fast recovery</b>. CUBIC (Linux default) grows as a cubic function for high-bandwidth links. <b>BBR</b> (Google) models bandwidth and RTT instead of reacting to loss — better on lossy/long paths.</li><li><b>Bandwidth-delay product:</b> throughput ≤ window / RTT. 100 ms RTT with 64 KB window = 5 Mbps max — why window scaling and large buffers matter for long-haul.</li><li><b>Nagle's algorithm</b> batches small writes (bad for latency-sensitive RPC → <code>TCP_NODELAY</code>). <b>Delayed ACK</b> interacts badly with Nagle (40 ms stalls).</li><li><b>Head-of-line blocking:</b> one lost segment stalls delivery of everything behind it in the stream — motivates QUIC.</li><li><b>Keepalives</b> detect dead peers (default 2 h! tune down). Idle connections through NAT/LB get dropped silently (~5 min) → send keepalives.</li></ul>
+<h3>Server-side queues (a very common PE question)</h3>
+<div class="ascii">incoming SYN ──► [ SYN queue (tcp_max_syn_backlog) ] ──handshake done──► [ accept queue (min(backlog, somaxconn)) ] ──accept()──► application
+Accept queue full → new connections dropped/SYN ignored (client sees timeouts / slow connects even though server CPU looks fine).
+Check: `ss -ltn` Recv-Q vs Send-Q on the LISTEN socket; `nstat -az TcpExtListenOverflows TcpExtListenDrops`.
+Fix: app must accept() faster (more workers / event loop), raise backlog + net.core.somaxconn.</div>
+
+<h2>UDP & QUIC <span class="badge basic">basics</span></h2>
+<p><b>UDP:</b> 8-byte header (ports, length, checksum). No connection, ordering, retransmission, or congestion control — the application does what it needs. Low latency, multicast/broadcast-capable. Used by DNS, DHCP, NTP, VoIP/video (RTP), games, syslog, metrics (StatsD), VXLAN tunnels.</p>
+<p><b>QUIC (HTTP/3):</b> reliable, multiplexed, encrypted transport over UDP, in user space. Fixes TCP's problems: 0–1 RTT handshake (TLS 1.3 built in), <b>no head-of-line blocking across streams</b> (loss in one stream doesn't stall others), <b>connection migration</b> (survives IP change — Wi-Fi → cellular — via connection IDs), pluggable congestion control, faster evolution (no kernel/middlebox ossification). Cost: CPU (user-space crypto, no NIC offload), UDP sometimes blocked.</p>
+
+<h2>DNS in depth <span class="badge basic">basics</span></h2>
+<div class="diagram"><svg viewBox="0 0 900 260" width="900">
+<rect class="box" x="20" y="100" width="100" height="50"/><text class="svg-text" x="70" y="130" text-anchor="middle">Browser</text>
+<rect class="box" x="160" y="100" width="110" height="50"/><text class="svg-text" x="215" y="122" text-anchor="middle">OS stub</text><text class="svg-mono" x="215" y="140" text-anchor="middle">/etc/hosts, cache</text>
+<rect class="box hl" x="320" y="100" width="150" height="50"/><text class="svg-text" x="395" y="122" text-anchor="middle">Recursive resolver</text><text class="svg-mono" x="395" y="140" text-anchor="middle">ISP / 8.8.8.8 / local</text>
+<rect class="box db" x="560" y="20" width="150" height="44"/><text class="svg-text" x="635" y="47" text-anchor="middle">Root (.) ×13 anycast</text>
+<rect class="box db" x="560" y="100" width="150" height="44"/><text class="svg-text" x="635" y="127" text-anchor="middle">TLD (.com)</text>
+<rect class="box db" x="560" y="180" width="150" height="44"/><text class="svg-text" x="635" y="207" text-anchor="middle">Authoritative (example.com)</text>
+<path class="wire" d="M120 125 H160"/><path class="wire" d="M270 125 H320"/>
+<path class="wire" d="M470 115 L560 42"/><path class="wire" d="M470 125 H560"/><path class="wire" d="M470 135 L560 202"/>
+<text class="svg-mono" x="470" y="80">1. "www.example.com A?" → "ask .com at 192.5.6.30"</text>
+<text class="svg-mono" x="720" y="127">2. → "ask ns1.example.com"</text>
+<text class="svg-mono" x="720" y="207">3. → "93.184.216.34 TTL 300"</text>
+<circle class="packet" r="5"><animateMotion dur="4s" repeatCount="indefinite" path="M120 125 H320 L470 115 L560 42 L470 125 H560 L470 135 L560 202 L470 125 H120"/></circle>
+<text class="svg-mono" x="20" y="250">Resolver caches each answer for its TTL. Typical cold lookup ≈ 20–120 ms; cached ≈ 0 ms. Most lookups never leave the resolver's cache.</text>
+</svg></div>
+<ul><li><b>Record types:</b> A (IPv4), AAAA (IPv6), CNAME (alias → must resolve again; not allowed at zone apex), MX (mail), NS (delegation), TXT (SPF, verification), SOA (zone metadata, serial), PTR (reverse), SRV (service discovery: port + priority), CAA.</li><li><b>TTL</b> trades freshness vs load: 300 s typical for things that fail over; 86400 for static. Lower TTL <i>before</i> a planned migration.</li><li><b>UDP 53</b> with fallback to TCP for responses >512 B (or >1232 with EDNS0); zone transfers over TCP. DoT/DoH encrypt it.</li><li><b>Negative caching:</b> NXDOMAIN cached per SOA minimum.</li><li><b>DNS as a load balancer:</b> multiple A records, GeoDNS, health-check-aware answers (Route53, NS1). Limits: client caching ignores TTL sometimes; no per-request balancing.</li><li><b>Failure modes:</b> resolver down → everything "down" even though servers are fine; expired domain; wrong serial so secondaries don't update; split-horizon confusion (internal vs external views); glibc tries resolvers sequentially with 5 s timeout.</li><li><b>Tools:</b> <code>dig +trace</code>, <code>dig +short</code>, <code>dig -x IP</code>, <code>dig @ns1 example.com SOA</code>, <code>resolvectl query</code>.</li></ul>
+
+<h2>HTTP: 1.1 → 2 → 3 <span class="badge basic">basics</span></h2>
+<table><tr><th></th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th></tr>
+<tr><td>Transport</td><td>TCP</td><td>TCP (+TLS in practice)</td><td>QUIC over UDP</td></tr>
+<tr><td>Format</td><td>Text</td><td>Binary frames</td><td>Binary frames</td></tr>
+<tr><td>Parallelism</td><td>1 request at a time per connection (pipelining unused) → browsers open 6 connections</td><td>Many streams multiplexed on one connection</td><td>Streams, independent at transport level</td></tr>
+<tr><td>Head-of-line blocking</td><td>At HTTP level</td><td>At TCP level (one lost packet stalls all streams)</td><td>None across streams</td></tr>
+<tr><td>Headers</td><td>Repeated, uncompressed</td><td>HPACK compression</td><td>QPACK</td></tr>
+<tr><td>Extras</td><td>Keep-alive, chunked transfer</td><td>Server push (deprecated), prioritization</td><td>0-RTT, connection migration</td></tr></table>
+<ul><li><b>Methods & idempotency:</b> GET/HEAD/PUT/DELETE idempotent (safe to retry); POST/PATCH not. GET is cacheable.</li><li><b>Headers to know:</b> <code>Host</code> (virtual hosting), <code>Content-Type/Length</code>, <code>Transfer-Encoding: chunked</code>, <code>Connection: keep-alive</code>, <code>Cache-Control</code> (max-age, no-store, private, s-maxage), <code>ETag</code>/<code>If-None-Match</code> (304), <code>Last-Modified</code>, <code>Location</code>, <code>Set-Cookie</code>, <code>Authorization</code>, <code>X-Forwarded-For</code> (original client IP behind proxies), <code>Retry-After</code>, CORS headers.</li><li><b>Status codes:</b> 1xx info, 2xx success, 3xx redirect (301 permanent, 302/307 temporary, 304 not modified), 4xx client error (400, 401 unauth, 403 forbidden, 404, 408 timeout, 429 rate-limited), 5xx server (500, 502 bad upstream response, 503 unavailable/overloaded, 504 upstream timeout). <b>502 vs 504 vs 503</b> tells you where in the chain it broke.</li><li><b>Persistent connections</b> save handshakes; connection pools in clients; idle timeouts must be aligned (client &lt; LB &lt; server, else races produce spurious 502s).</li><li><b>Cookies vs tokens</b>, sessions, CORS, same-origin policy — basics of web security.</li></ul>
+
+<h2>TLS <span class="badge basic">basics</span> → <span class="badge deep">deep dive</span></h2>
+<div class="steps">
+<div class="step"><b>ClientHello:</b> supported TLS versions, cipher suites, SNI (which hostname — lets one IP serve many certs), key share (TLS 1.3 sends the ECDHE public key immediately).</div>
+<div class="step"><b>ServerHello + Certificate + key share:</b> server picks the cipher, sends its certificate chain (leaf → intermediate → root is in the client's trust store), signs the handshake with its private key.</div>
+<div class="step"><b>Client verifies:</b> chain of signatures to a trusted root, hostname matches SAN, not expired, not revoked (OCSP stapling / CRL). Both derive the same symmetric session key from the ECDHE exchange — <b>forward secrecy</b> (compromising the server key later doesn't decrypt past traffic).</div>
+<div class="step"><b>Finished:</b> encrypted application data begins. TLS 1.3 = 1 RTT (0-RTT resumption possible); TLS 1.2 = 2 RTT. Session resumption (tickets) skips the full handshake.</div>
+</div>
+<ul><li><b>Asymmetric</b> (RSA/ECDSA) for identity & key exchange — slow; <b>symmetric</b> (AES-GCM, ChaCha20) for bulk — fast. Hash (SHA-256) for integrity.</li><li><b>Certificates</b> from a CA (Let's Encrypt via ACME automates); expiry is the #1 self-inflicted outage → monitor expiry, automate renewal. Internal PKI + <b>mTLS</b> for service-to-service identity.</li><li><b>Termination</b> at LB/edge (centralize certs, inspect traffic) vs <b>passthrough</b> (end-to-end, LB can't see HTTP). Re-encrypt to backends for zero-trust.</li><li>Debug: <code>openssl s_client -connect host:443 -servername host</code>, <code>curl -vI https://…</code>, browser cert viewer. Errors: "unknown CA" (missing intermediate!), "hostname mismatch", "expired", protocol/cipher mismatch with old clients.</li></ul>
+
+<h2>Load balancers, proxies & the edge <span class="badge deep">deep dive</span></h2>
+<ul><li><b>Forward proxy</b> (client side: egress control, caching, anonymity) vs <b>reverse proxy</b> (server side: LB, TLS, caching, WAF). Nginx/HAProxy/Envoy are reverse proxies.</li><li><b>L4 LB modes:</b> NAT (rewrite dst IP; replies must return via LB), <b>DSR</b> (Direct Server Return: LB rewrites MAC only; server replies directly to client — huge egress scaling, used for video), IP-in-IP/GRE tunneling (Maglev, Katran). Connection table or consistent hashing to keep flows on the same backend across LB instances.</li><li><b>Preserving client IP</b> through L4/L7: X-Forwarded-For header (L7), PROXY protocol (L4), or DSR/transparent mode.</li><li><b>Anycast + ECMP + consistent hashing</b> = how hyperscalers build stateless, horizontally-scaled L4 tiers.</li><li><b>Edge/PoP architecture:</b> user → nearest PoP (TLS termination, HTTP caching, DDoS absorption) → long-lived backbone connections to datacenters → L7 routing to services. Reduces TLS/TCP handshake latency dramatically (RTT to PoP ≈ 10 ms vs 100 ms to DC).</li></ul>
+
+<h2>"What happens when you type a URL?" — the full answer <span class="badge pe">PE core</span></h2>
+<p>Deliver this in layers; go deeper wherever the interviewer bites.</p>
+<div class="steps">
+<div class="step"><b>Browser parsing:</b> URL → scheme, host, port, path. Checks HSTS (force https). Checks browser cache for a fresh response.</div>
+<div class="step"><b>DNS:</b> browser cache → OS resolver (<code>/etc/hosts</code>, nscd/systemd-resolved cache) → recursive resolver (UDP 53) → root → TLD → authoritative → A/AAAA with TTL. GeoDNS may return a nearby PoP IP. (Dive: TTLs, negative caching, DoH, Happy Eyeballs for v4/v6 racing.)</div>
+<div class="step"><b>Socket & routing:</b> kernel picks a source IP/ephemeral port; routing table → default gateway; ARP for gateway MAC (cached); frame out the NIC. Each router decrements TTL, longest-prefix-matches, rewrites MACs. NAT at home router. (Dive: MTU, ECMP, BGP path.)</div>
+<div class="step"><b>TCP handshake:</b> SYN → SYN-ACK → ACK (1 RTT). Server side: SYN queue → accept queue → <code>accept()</code>. (Dive: SYN cookies, backlog, initcwnd, TCP Fast Open.)</div>
+<div class="step"><b>TLS handshake:</b> ClientHello with SNI → cert chain → verify → ECDHE key → encrypted (1 RTT on 1.3). Terminated at the edge LB/PoP. (Dive: cert validation, OCSP, session resumption, ALPN negotiating h2/h3.)</div>
+<div class="step"><b>HTTP request:</b> <code>GET / HTTP/2</code> with Host, cookies, Accept-*. Edge: WAF, rate limit, cache check, route by host/path → L7 LB → service (via internal service discovery, maybe gRPC/Thrift inside).</div>
+<div class="step"><b>Server:</b> auth (session cookie → user), app logic, cache lookups (memcache), DB queries (sharded MySQL/TAO), fan-out to dozens of services, assemble response. Logs, metrics, trace emitted.</div>
+<div class="step"><b>Response:</b> 200 + headers (Cache-Control, Content-Encoding: br/gzip, Set-Cookie) + HTML. Streams back through the same path; TCP congestion control governs speed; CDN caches static assets.</div>
+<div class="step"><b>Browser rendering:</b> parse HTML → DOM; fetch CSS/JS/images (many parallel streams on one h2 connection; preconnect/preload hints); CSSOM; JS executes; layout; paint; composite. Subsequent XHR/fetch calls to APIs; WebSocket upgrades for realtime.</div>
+<div class="step"><b>Teardown:</b> connections kept alive for reuse; idle timeout → FIN/ACK; TIME_WAIT on the closer.</div>
+</div>
+<div class="callout pe"><b>Where PEs add value in this answer</b>At every step name <b>what can fail and how you'd see it</b>: DNS NXDOMAIN/timeout (dig), SYN timeouts (tcpdump shows retransmitted SYNs → firewall/backlog), TLS errors (openssl s_client), 502/504 (LB logs: upstream down/slow), slow TTFB (server-side tracing), slow transfer (bandwidth/loss, mtr). That is the difference between a SWE answer and a PE answer.</div>
+
+<h2>Network troubleshooting playbook <span class="badge pe">PE core</span></h2>
+<div class="ascii">Symptom                          First checks                                         Likely causes
+───────────────────────────────  ───────────────────────────────────────────────────  ──────────────────────────────────────────────
+"Can't reach host"               ping; ip route get HOST; mtr HOST; nc -zv HOST PORT  no route, firewall, host down, wrong VLAN, ARP
+"Connection refused"             ss -ltnp on server; iptables REJECT rules            nothing listening / bound to 127.0.0.1 only / REJECT
+"Connection timed out"           tcpdump both ends: do SYNs arrive? SYN-ACKs return?  DROP firewall, asymmetric routing, backlog full, NAT table full
+"Intermittent slowness"          mtr (loss per hop); ss -ti (retrans, rtt, cwnd);     packet loss, duplex mismatch, buffer bloat, ECMP path with bad link
+                                 nstat retrans counters; ethtool -S errors
+"Works small, fails large"       ping -M do -s 1472; tracepath                        MTU/PMTU blackhole (ICMP blocked, tunnels/VXLAN overhead)
+"DNS slow/failing"               dig @each-resolver; resolvectl; check timeouts        resolver down/overloaded, UDP loss, glibc sequential 5s timeouts
+"TLS errors"                     openssl s_client; check dates & chain                expired cert, missing intermediate, SNI mismatch, clock skew
+"502/504 at LB"                  LB logs; curl backend directly; backend health        backend down/slow, idle-timeout mismatch, upstream keepalive bug
+"Ephemeral port exhaustion"      ss -s (TIME_WAIT); ip_local_port_range               proxy without keepalive/pooling; fix pooling, tw_reuse, more IPs
+"Packets dropped on host"        ip -s link; ethtool -S; /proc/net/softnet_stat        ring buffer overrun, softirq saturation (irqbalance/RSS), conntrack full</div>
+<pre><code># the essential capture: see the handshake and any RST/retransmits for one host:port
+sudo tcpdump -i any -nn 'host 10.0.0.5 and port 443' -c 200
+# per-connection TCP internals: RTT, cwnd, retransmits
+ss -ti dst 10.0.0.5
+# which path & where loss happens (run for 60s+)
+mtr -rwzc 100 example.com
+# HTTP timing breakdown
+curl -so /dev/null -w 'dns %{time_namelookup} tcp %{time_connect} tls %{time_appconnect} ttfb %{time_starttransfer} total %{time_total} code %{http_code}\n' https://example.com/</code></pre>
+
+<h2>SSH, in case they ask "how does SSH work?"</h2>
+<p>TCP 22 → version exchange → key exchange (Diffie-Hellman; derives session keys; <b>host key</b> authenticates the server — the "fingerprint" prompt / <code>known_hosts</code>) → encrypted channel → user authentication (password, or <b>public key</b>: server sends a challenge, client signs with the private key; server verifies against <code>authorized_keys</code>; or certificates signed by a CA for fleets) → session channel: shell/exec/sftp, plus port forwarding (<code>-L</code> local, <code>-R</code> remote, <code>-D</code> SOCKS) and agent forwarding (<code>-A</code>, risky). Config in <code>sshd_config</code>; always <code>sshd -t</code> before reload. Bastion/jump hosts (<code>-J</code>); short-lived certificates replace key sprawl at scale.</p>
+
+<h2>Self-test: networking rapid fire</h2>
+<div class="quiz">
+<div class="q"><b>TCP vs UDP — when would you pick UDP?</b><div class="ans">When low latency matters more than reliability or you implement your own (DNS, video/VoIP where a late packet is useless, games, metrics, QUIC). TCP for anything needing ordered, complete delivery without extra work.</div></div>
+<div class="q"><b>Why does a TCP connection need 3 packets to open but 4 to close?</b><div class="ans">Opening: SYN and ACK of the first SYN are combined into SYN-ACK. Closing: each direction closes independently (half-close); the passive side may still send data after ACKing the FIN, so its own FIN comes separately. (It can combine FIN+ACK if it has nothing more to send.)</div></div>
+<div class="q"><b>A client sees "connection reset by peer." What happened?</b><div class="ans">Received an RST: the server (or a middlebox) aborted — nothing listening on that port, process crashed mid-connection, the server closed with unread data in its buffer, firewall sending RST, or a load balancer/NAT lost connection state (idle timeout) and rejects the next packet.</div></div>
+<div class="q"><b>What is the difference between a 502 and a 504?</b><div class="ans">Both come from a proxy/LB. 502 Bad Gateway: the upstream gave an invalid response or refused the connection (dead/crashed/not listening). 504 Gateway Timeout: the upstream accepted but didn't respond within the proxy's timeout (slow/hung). 503: the server itself says it's unavailable/overloaded.</div></div>
+<div class="q"><b>How does traceroute work, and why do some hops show * * *?</b><div class="ans">Sends packets with TTL=1,2,3…; each router that decrements TTL to 0 returns ICMP Time Exceeded, revealing its IP. Stars = router doesn't send ICMP / rate-limits it / firewall blocks it; traffic may still pass fine. Also paths can differ per packet (ECMP) — use Paris traceroute/mtr.</div></div>
+<div class="q"><b>Explain how anycast lets 13 root DNS "servers" serve the world.</b><div class="ans">Each root letter's IP is announced via BGP from hundreds of locations; routers pick the nearest announcement, so the same IP lands on a nearby instance. Stateless UDP DNS works perfectly with this; failover is automatic when a site stops announcing. (Over 1,500 root server instances exist.)</div></div>
+<div class="q"><b>Why is HTTP/2 over a lossy network sometimes slower than HTTP/1.1 with 6 connections?</b><div class="ans">TCP head-of-line blocking: one lost packet stalls all multiplexed streams on the single h2 connection until retransmitted, whereas with 6 separate TCP connections only one stream stalls. HTTP/3 (QUIC) solves this with per-stream loss recovery.</div></div>
+<div class="q"><b>What does ARP do and what happens when a VIP fails over between two load balancers?</b><div class="ans">ARP maps IP → MAC on the local segment. On failover, the new owner sends a gratuitous ARP announcing the VIP with its MAC so switches/hosts update their caches immediately; otherwise traffic goes to the dead MAC until ARP entries expire.</div></div>
+</div>
+
+<div class="footer-nav"><a href="linux.html">← Linux</a><a href="interview.html">Next: Interview Kit →</a></div>
+</main></div>
+<script src="app.js"></script></body></html>

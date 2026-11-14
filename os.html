@@ -1,0 +1,199 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Operating Systems — PE Prep</title><link rel="stylesheet" href="styles.css"></head><body>
+<div class="layout"><aside class="sidebar"></aside>
+<main>
+<section class="hero"><h1>Operating Systems</h1><p class="lead">What actually happens inside a Linux box. PE interviewers love "what happens when…" questions that walk from a shell command down through the kernel. Build the mental model here; the Linux page turns it into debugging skill.</p></section>
+
+<h2>The big picture: kernel vs user space <span class="badge basic">basics</span></h2>
+<div class="diagram"><svg viewBox="0 0 900 300" width="900">
+<rect x="20" y="20" width="860" height="100" fill="#151c2c" stroke="#3a4a70" rx="10"/><text class="svg-text" x="35" y="42" font-weight="700">USER SPACE (ring 3) — unprivileged, each process has its own virtual address space</text>
+<rect class="box" x="40" y="55" width="130" height="50"/><text class="svg-text" x="105" y="85" text-anchor="middle">bash</text>
+<rect class="box" x="200" y="55" width="130" height="50"/><text class="svg-text" x="265" y="85" text-anchor="middle">nginx</text>
+<rect class="box" x="360" y="55" width="130" height="50"/><text class="svg-text" x="425" y="85" text-anchor="middle">python app.py</text>
+<rect class="box" x="520" y="55" width="130" height="50"/><text class="svg-text" x="585" y="85" text-anchor="middle">libc (glibc)</text>
+<rect x="20" y="150" width="860" height="130" fill="#1a1230" stroke="#7c5cff" rx="10"/><text class="svg-text" x="35" y="172" font-weight="700">KERNEL SPACE (ring 0) — full hardware access, one shared address space</text>
+<rect class="box" x="40" y="185" width="120" height="40"/><text class="svg-text" x="100" y="210" text-anchor="middle">Scheduler</text>
+<rect class="box" x="175" y="185" width="120" height="40"/><text class="svg-text" x="235" y="210" text-anchor="middle">Memory mgmt (VM)</text>
+<rect class="box" x="310" y="185" width="120" height="40"/><text class="svg-text" x="370" y="210" text-anchor="middle">VFS + filesystems</text>
+<rect class="box" x="445" y="185" width="120" height="40"/><text class="svg-text" x="505" y="210" text-anchor="middle">Network stack</text>
+<rect class="box" x="580" y="185" width="120" height="40"/><text class="svg-text" x="640" y="210" text-anchor="middle">Device drivers</text>
+<rect class="box" x="715" y="185" width="145" height="40"/><text class="svg-text" x="787" y="210" text-anchor="middle">IPC, signals, cgroups</text>
+<text class="svg-mono" x="35" y="265">Hardware: CPU cores, RAM, NICs, disks — only the kernel touches them directly</text>
+<path class="wire anim" d="M425 105 V150"/><text class="svg-mono" x="435" y="140">syscall (read, write, open, socket, fork, mmap…) — trap into kernel, ~100ns–1µs</text>
+<circle class="packet y" r="5"><animateMotion dur="1.5s" repeatCount="indefinite" path="M425 105 V150 V105"/></circle>
+</svg></div>
+<p>A program never touches hardware. It asks the kernel via <b>system calls</b> — the only doorway. <code>printf</code> → libc buffers → <code>write(1, buf, n)</code> syscall → kernel → tty driver. Use <code>strace</code> to see every syscall a process makes; this is the PE's X-ray.</p>
+
+<h2>Processes <span class="badge basic">basics</span></h2>
+<p>A <b>process</b> is a running program: its own <b>virtual address space</b>, file descriptors, credentials, signal handlers, and at least one thread. Tracked by the kernel in a <code>task_struct</code>; identified by a <b>PID</b>; has a parent (PPID). Everything descends from PID 1 (<code>init</code>/<code>systemd</code>).</p>
+<h3>Memory layout of a process</h3>
+<div class="ascii">high addresses  ┌─────────────────────────┐  0x7fff...
+                │  kernel (mapped, inaccessible)
+                ├─────────────────────────┤
+                │  stack  ↓ grows down     │  local variables, return addresses; 8 MB default (ulimit -s); overflow → SIGSEGV
+                │  ...                     │
+                │  mmap region             │  shared libs (libc.so), mmap'd files, thread stacks, large mallocs
+                │  ...                     │
+                │  heap   ↑ grows up       │  malloc/free (brk/sbrk + mmap); fragmentation lives here
+                ├─────────────────────────┤
+                │  .bss   (zeroed globals) │
+                │  .data  (initialized globals)
+                │  .text  (code, read-only, shared between processes running the same binary)
+low addresses   └─────────────────────────┘  0x400000</div>
+<h3>Process states</h3>
+<table><tr><th>State (ps)</th><th>Meaning</th><th>PE relevance</th></tr>
+<tr><td>R — running/runnable</td><td>On a CPU or waiting in the run queue</td><td>Many R = CPU contention; counts toward load average</td></tr>
+<tr><td>S — interruptible sleep</td><td>Waiting for an event (socket data, timer); wakeable by signals</td><td>Normal idle state for servers</td></tr>
+<tr><td>D — uninterruptible sleep</td><td>Waiting on I/O (disk, NFS); cannot be killed until it returns</td><td><b>Counts toward load average in Linux!</b> Many D = I/O bottleneck or hung NFS. <code>kill -9</code> won't work.</td></tr>
+<tr><td>T — stopped</td><td>SIGSTOP / debugger</td><td><code>Ctrl-Z</code>, gdb</td></tr>
+<tr><td>Z — zombie</td><td>Exited but parent hasn't <code>wait()</code>ed; only the PID + exit status remain</td><td>Harmless individually; thousands = buggy parent leaking PIDs. Fix the parent (or kill it so init reaps).</td></tr></table>
+
+<h3>fork, exec, wait: how every program starts <span class="badge deep">deep dive</span></h3>
+<div class="stepper" data-steps='["Shell is waiting for input. You type <code>ls -l</code> and press Enter.","<b>fork()</b>: the kernel clones the shell into a child process — same code, same open FDs, copy-on-write memory (pages are shared until written; cheap even for a 1 GB process). Returns child PID to parent, 0 to child.","In the child: optional redirections — <code>dup2()</code> to point FD 1 at a file for <code>&gt; out.txt</code>. Then <b>execve(\"/bin/ls\", [\"ls\",\"-l\"], env)</b>: the kernel replaces the child&#39;s memory image with the new program. PID stays; FDs stay (unless O_CLOEXEC). Shell searched $PATH to find /bin/ls.","The dynamic loader (ld.so) maps libc and other shared libs; ls runs: <code>openat(\".\")</code>, <code>getdents64()</code> to list entries, <code>lstat()</code> on each, <code>write(1, …)</code> to the terminal.","ls calls <code>exit(0)</code> → kernel frees memory, closes FDs, sends <b>SIGCHLD</b> to the parent; the process becomes a zombie holding only its exit status.","Parent shell calls <b>waitpid()</b> → collects exit status ($? = 0) → zombie is reaped; shell prints the prompt. If the parent never waits, the zombie persists; if the parent dies first, the child is re-parented to init (orphan) which reaps it."]'>
+<div class="diagram"><svg viewBox="0 0 900 200" width="900">
+<rect class="box hl" x="20" y="70" width="140" height="60" data-step="0,1,2,3,4,5"/><text class="svg-text" x="90" y="95" text-anchor="middle" data-step="0,1,2,3,4,5">bash (PID 100)</text><text class="svg-mono" x="90" y="115" text-anchor="middle" data-step="0">waiting</text><text class="svg-mono" x="90" y="115" text-anchor="middle" data-step="1,2,3,4">blocked in wait()</text><text class="svg-mono" x="90" y="115" text-anchor="middle" data-step="5">$? = 0, prompt</text>
+<path class="wire" d="M160 100 H300" data-step="1,2,3,4,5"/><text class="svg-mono" x="200" y="90" data-step="1">fork()</text>
+<rect class="box" x="300" y="70" width="150" height="60" data-step="1"/><text class="svg-text" x="375" y="95" text-anchor="middle" data-step="1">bash copy (PID 101)</text><text class="svg-mono" x="375" y="115" text-anchor="middle" data-step="1">COW pages shared</text>
+<rect class="box" x="300" y="70" width="150" height="60" data-step="2"/><text class="svg-text" x="375" y="95" text-anchor="middle" data-step="2">child: dup2, execve</text><text class="svg-mono" x="375" y="115" text-anchor="middle" data-step="2">image replaced</text>
+<rect class="box hl" x="300" y="70" width="150" height="60" data-step="3"/><text class="svg-text" x="375" y="95" text-anchor="middle" data-step="3">ls (PID 101)</text><text class="svg-mono" x="375" y="115" text-anchor="middle" data-step="3">getdents, lstat, write</text>
+<rect class="box" x="300" y="70" width="150" height="60" data-step="4" style="stroke:#ff5c7a"/><text class="svg-text" x="375" y="95" text-anchor="middle" data-step="4">zombie (PID 101)</text><text class="svg-mono" x="375" y="115" text-anchor="middle" data-step="4">exit status only</text>
+<path class="wire" d="M450 100 H600" data-step="3"/><rect class="box" x="600" y="70" width="120" height="60" data-step="3"/><text class="svg-text" x="660" y="105" text-anchor="middle" data-step="3">terminal (FD 1)</text>
+<path class="wire" d="M300 120 Q 230 170 160 120" data-step="4" stroke="#ff5c7a"/><text class="svg-mono" x="190" y="165" data-step="4">SIGCHLD</text>
+<text class="svg-mono" x="300" y="105" data-step="5" text-anchor="start">(reaped — PID 101 freed)</text>
+</svg></div>
+<div class="controls"><button class="btn sm prev">← Prev</button><span class="count tag"></span><button class="btn sm next">Next →</button></div><div class="step-text card"></div></div>
+<p><b>Copy-on-write:</b> fork doesn't copy memory; it copies page tables and marks pages read-only. The first write by either process triggers a page fault and the kernel copies that page. This makes fork cheap and is why Redis can snapshot by forking. <code>vfork</code>/<code>posix_spawn</code> exist for the fork-then-immediately-exec case.</p>
+<p><b>Daemonizing</b> (old-school): fork, parent exits (child is orphaned → adopted by init), <code>setsid()</code> for a new session (no controlling terminal), fork again, chdir /, close FDs 0–2, redirect to /dev/null. systemd makes this unnecessary — it runs services in the foreground and manages them.</p>
+
+<h2>Threads & concurrency <span class="badge basic">basics</span></h2>
+<div class="compare">
+<div class="card"><h4>Process</h4>Own address space. Isolation: a crash doesn't take down others. Communication needs IPC. Creation ~100 µs+ (fork COW). Context switch flushes TLB (expensive).</div>
+<div class="card"><h4>Thread</h4>Shares address space, heap, FDs with sibling threads; own stack, registers, PC. Cheap communication (shared memory) but data races. Linux implements threads as tasks sharing resources (<code>clone()</code> with CLONE_VM|CLONE_FILES…); each has its own TID; <code>ps -L</code> shows them.</div>
+</div>
+<h3>Synchronization primitives</h3>
+<ul><li><b>Mutex:</b> one owner at a time; others block (futex: fast user-space path, kernel only on contention).</li><li><b>Spinlock:</b> busy-wait; for very short critical sections, kernel/multi-core only.</li><li><b>RW lock:</b> many readers or one writer.</li><li><b>Semaphore:</b> counter; N concurrent holders. </li><li><b>Condition variable:</b> wait for a predicate, signaled by another thread; always paired with a mutex and a while-loop (spurious wakeups).</li><li><b>Atomics / CAS:</b> lock-free counters, compare-and-swap loops.</li></ul>
+<h3>Deadlock</h3>
+<p>Four necessary conditions (Coffman): <b>mutual exclusion</b>, <b>hold and wait</b>, <b>no preemption</b>, <b>circular wait</b>. Break one to prevent: acquire locks in a <b>global order</b> (kills circular wait), try-lock with timeout + back off, or acquire all at once. Detect via wait-for graph cycles. Related: <b>livelock</b> (everyone backs off forever), <b>starvation</b>, <b>priority inversion</b> (low-priority holder blocks high-priority waiter; fixed by priority inheritance — the Mars Pathfinder bug).</p>
+<h3>Python's GIL (common PE question)</h3><p>CPython's Global Interpreter Lock lets only one thread execute Python bytecode at a time → threads don't speed up CPU-bound code (use <code>multiprocessing</code>), but do help I/O-bound code (the GIL is released during blocking I/O). asyncio: single-threaded cooperative concurrency via an event loop — ideal for many concurrent network connections.</p>
+
+<h2>CPU scheduling <span class="badge deep">deep dive</span></h2>
+<p>The scheduler decides which runnable task gets each CPU core and for how long. Linux's <b>CFS</b> (Completely Fair Scheduler; replaced by <b>EEVDF</b> in 6.6) tracks each task's <i>virtual runtime</i> and always runs the one that has had the least CPU, weighted by <b>nice</b> (−20 highest priority … +19 lowest). Tasks sit in a red-black tree ordered by vruntime. Time slices are dynamic (~1–6 ms); a sleeping task that wakes gets scheduled soon because its vruntime is low (good for interactive/I/O-bound).</p>
+<ul><li><b>Context switch:</b> save registers/PC/stack pointer, switch page tables (CR3; flushes TLB unless PCID), restore the next task. ~1–5 µs direct cost + cache/TLB pollution. <code>vmstat</code> <code>cs</code> column; very high = too many threads or lock thrashing.</li><li><b>Preemptive</b> (kernel interrupts a running task on timer tick / wakeup) vs <b>cooperative</b> (task yields — e.g., goroutines before Go 1.14, asyncio).</li><li><b>Real-time classes:</b> SCHED_FIFO / SCHED_RR run before all normal tasks — dangerous if a busy loop (can lock up a core).</li><li><b>CPU affinity</b> (<code>taskset</code>), <b>NUMA</b>: memory attached to a remote socket is slower; the scheduler tries to keep tasks near their memory.</li><li><b>cgroups CPU controller:</b> shares (relative weight) and quota (hard cap: <code>cpu.max</code>) — how containers get "2 CPUs". Throttling shows up as latency spikes while CPU looks idle! Check <code>cpu.stat nr_throttled</code>.</li></ul>
+<div class="callout pe"><b>Load average explained (asked constantly)</b>The 1/5/15-minute exponentially-damped averages of the number of tasks that are <b>running or runnable (R) plus in uninterruptible sleep (D)</b>. On a 4-core box, load 4 ≈ fully busy; load 8 = tasks waiting. Because of D, a high load with idle CPU means an <b>I/O bottleneck</b> (disk, NFS) — look at <code>vmstat</code> <code>b</code> column, <code>iostat</code> <code>%util</code>/<code>await</code>, <code>ps -eo stat</code> for D. Load average alone never tells you why — it's a prompt to look at CPU vs I/O.</div>
+
+<h2>Memory: virtual memory & paging <span class="badge basic">basics</span></h2>
+<p>Every process sees a private, contiguous, huge address space (48 bits = 256 TB) — an illusion. The <b>MMU</b> translates virtual addresses to physical via <b>page tables</b> (4 KB pages, 4-level tree on x86-64), cached in the <b>TLB</b>. The kernel lazily backs pages with physical RAM only when touched.</p>
+<div class="diagram"><svg viewBox="0 0 900 260" width="900">
+<rect class="box" x="20" y="30" width="180" height="200"/><text class="svg-text" x="110" y="52" text-anchor="middle" font-weight="700">Process A virtual</text>
+<rect x="35" y="65" width="150" height="26" fill="#223055" rx="4"/><text class="svg-mono" x="110" y="83" text-anchor="middle">page 0 (code)</text>
+<rect x="35" y="96" width="150" height="26" fill="#223055" rx="4"/><text class="svg-mono" x="110" y="114" text-anchor="middle">page 1 (heap)</text>
+<rect x="35" y="127" width="150" height="26" fill="#223055" rx="4"/><text class="svg-mono" x="110" y="145" text-anchor="middle">page 2 (heap, untouched)</text>
+<rect x="35" y="158" width="150" height="26" fill="#223055" rx="4"/><text class="svg-mono" x="110" y="176" text-anchor="middle">page 3 (libc)</text>
+<rect x="35" y="189" width="150" height="26" fill="#223055" rx="4"/><text class="svg-mono" x="110" y="207" text-anchor="middle">page 4 (swapped)</text>
+<rect class="box hl" x="300" y="80" width="140" height="100"/><text class="svg-text" x="370" y="105" text-anchor="middle">Page table</text><text class="svg-mono" x="370" y="125" text-anchor="middle">VPN → PFN + bits</text><text class="svg-mono" x="370" y="142" text-anchor="middle">present, R/W, dirty,</text><text class="svg-mono" x="370" y="158" text-anchor="middle">accessed, user</text>
+<rect class="box" x="300" y="200" width="140" height="34"/><text class="svg-mono" x="370" y="222" text-anchor="middle">TLB (cache, ~1500 entries)</text>
+<rect class="box db" x="540" y="30" width="160" height="200"/><text class="svg-text" x="620" y="52" text-anchor="middle" font-weight="700">Physical RAM</text>
+<rect x="555" y="65" width="130" height="26" fill="#1a3a4a" rx="4"/><text class="svg-mono" x="620" y="83" text-anchor="middle">frame 7</text>
+<rect x="555" y="96" width="130" height="26" fill="#1a3a4a" rx="4"/><text class="svg-mono" x="620" y="114" text-anchor="middle">frame 2</text>
+<rect x="555" y="127" width="130" height="26" fill="#1a3a4a" rx="4"/><text class="svg-mono" x="620" y="145" text-anchor="middle">frame 9 (libc, shared)</text>
+<rect x="555" y="158" width="130" height="26" fill="#1a3a4a" rx="4"/><text class="svg-mono" x="620" y="176" text-anchor="middle">page cache</text>
+<rect x="555" y="189" width="130" height="26" fill="#1a3a4a" rx="4"/><text class="svg-mono" x="620" y="207" text-anchor="middle">free</text>
+<rect class="box" x="760" y="150" width="120" height="80"/><text class="svg-text" x="820" y="185" text-anchor="middle">Swap (disk)</text><text class="svg-mono" x="820" y="205" text-anchor="middle">1000× slower</text>
+<path class="wire" d="M185 78 L555 78"/><path class="wire" d="M185 109 L555 109"/><path class="wire" d="M185 171 L555 140"/>
+<path class="wire" d="M185 202 L760 190" stroke="#ff5c7a" stroke-dasharray="4 4"/>
+<text class="svg-mono" x="190" y="135" fill="#ffc857">page 2: not present → first touch = minor fault, kernel assigns a frame</text>
+<text class="svg-mono" x="20" y="250">Process B maps libc to the SAME frame 9 → shared libraries use RAM once. "RSS" counts it for both → RSS over-counts; use PSS.</text>
+</svg></div>
+<h3>Page faults</h3>
+<ul><li><b>Minor (soft) fault:</b> page not mapped but in RAM (first touch of allocated memory, COW, page cache hit) — microseconds. Normal.</li><li><b>Major (hard) fault:</b> page must be read from disk (swap-in, or file-backed page not in cache) — milliseconds. High major fault rate (<code>sar -B</code>, <code>vmstat</code> <code>si/so</code>) = memory pressure → thrashing.</li><li><b>Segfault:</b> accessing an unmapped or protected page → SIGSEGV.</li></ul>
+<h3>Where memory goes (<code>free -m</code> is misleading)</h3>
+<div class="ascii">              total        used        free      shared  buff/cache   available
+Mem:          64000       21000        2000         300       41000       42000
+                                        ▲                      ▲              ▲
+                          "free" is tiny — GOOD      page cache: file data  what you can actually allocate
+                          unused RAM is wasted RAM   kernel evicts it on demand  (free + reclaimable cache)</div>
+<ul><li><b>Page cache:</b> kernel caches file contents in otherwise-idle RAM; reads hit RAM, writes become <b>dirty pages</b> flushed by background writeback (every ~30 s or when dirty ratio exceeded). This is why the second read of a file is instant and why <code>sync</code> exists.</li><li><b>RSS</b> (resident set), <b>VSZ</b> (virtual size — meaningless for leaks), <b>PSS</b> (proportional, splits shared), <b>USS</b> (unique). Leak hunting: watch RSS/USS over time.</li><li><b>Anonymous</b> memory (heap/stack; only reclaimable to swap) vs <b>file-backed</b> (reclaimable by dropping).</li><li><b>Huge pages</b> (2 MB): fewer TLB misses for big-memory apps (DBs). <b>Transparent huge pages</b> can cause latency spikes (compaction) — DBs often disable them.</li><li><b>Overcommit:</b> Linux lets you malloc more than exists (<code>vm.overcommit_memory</code>); the bill comes due on touch → OOM.</li></ul>
+<h3>The OOM killer <span class="badge pe">PE</span></h3>
+<p>When RAM + swap are exhausted and nothing is reclaimable, the kernel picks a process to kill based on <code>oom_score</code> (mostly RSS; tunable with <code>oom_score_adj</code> −1000…1000). Log in <code>dmesg</code>: <code>Out of memory: Killed process 1234 (java) total-vm:… anon-rss:…</code>. In cgroups (containers), the <i>container's</i> limit triggers a cgroup OOM, killing a process inside — Kubernetes reports <code>OOMKilled</code>, exit code 137. Debug: <code>dmesg -T | grep -i oom</code>, cgroup <code>memory.events</code>, check for a leak (RSS growth) vs undersized limit vs page-cache-counted-against-cgroup confusion.</p>
+<h3>Swap: friend or foe?</h3><p>Swap lets the kernel move rarely-used anonymous pages to disk to keep more page cache. A little swapping of cold pages is fine; <b>sustained swapping (si/so in vmstat)</b> means thrashing — latency goes 1000×. Many fleets run swapless so failure is a fast, clean OOM instead of slow death; others use small swap + <code>vm.swappiness</code> tuning. Know both arguments.</p>
+
+<h2>Files, file descriptors & the VFS <span class="badge basic">basics</span></h2>
+<p>"Everything is a file": regular files, directories, devices, pipes, sockets are all accessed via <b>file descriptors</b> — small integers indexing the process's FD table → open file description (offset, flags) → inode. FD 0 = stdin, 1 = stdout, 2 = stderr.</p>
+<div class="ascii">process FD table         open file table (system-wide)        inode (per file on disk)
+┌───┬────────┐           ┌────────────────────────┐          ┌──────────────────────┐
+│ 0 │ ───────┼─────────► │ /dev/pts/3  off=0 RDWR │          │ ino 48213, mode 0644 │
+│ 1 │ ───────┼──┐        ├────────────────────────┤          │ uid, gid, size, times│
+│ 2 │ ───────┼──┴──────► │ /dev/pts/3  (shared)   │          │ link count = 1       │
+│ 3 │ ───────┼─────────► │ /var/log/app.log       ├────────► │ block pointers ──► data blocks
+│ 4 │ ───────┼─────────► │ socket TCP :443        │          └──────────────────────┘
+└───┴────────┘           └────────────────────────┘
+fork() copies the FD table → child shares the SAME open file descriptions (shared offset!) — why redirected output from parent+child interleaves correctly.</div>
+<ul><li><b>Inode</b> stores metadata + where data blocks are — <i>not</i> the filename. The <b>directory</b> is a file mapping names → inode numbers. <b>Hard link</b> = another name for the same inode (link count++); <b>symlink</b> = a file containing a path. Deleting a file = <code>unlink</code>: remove the name, decrement count; data freed only when count = 0 <b>and no process has it open</b>.</li><li><b>Classic incident:</b> disk full but <code>du</code> shows space free → a process still holds a deleted log file open. <code>lsof +L1</code> or <code>lsof | grep deleted</code>; truncate via <code>/proc/PID/fd/N</code> or restart the process. Also: out of <b>inodes</b> (<code>df -i</code>) from millions of tiny files while bytes remain.</li><li><b>Permissions:</b> rwx for owner/group/other, octal (755), setuid/setgid/sticky bits; directory x = traverse. <code>umask</code> masks defaults.</li><li><b>FD limits:</b> per-process (<code>ulimit -n</code>, default 1024!) and system-wide (<code>fs.file-max</code>). "Too many open files" (EMFILE) is a classic outage for servers with many connections; raise in systemd unit <code>LimitNOFILE</code>.</li><li><b>Write path:</b> <code>write()</code> copies into page cache (returns immediately) → marked dirty → writeback to disk later. Durability requires <code>fsync()</code> (file data + metadata) — DBs call it on commit. Power loss between write and fsync loses data. <code>O_DIRECT</code> bypasses cache.</li><li><b>VFS</b> abstracts filesystems (ext4, XFS, btrfs, tmpfs, procfs, NFS, overlayfs for containers) behind one API. <b>Journaling</b> (ext4/XFS) logs metadata changes before applying → consistent after crash without full fsck.</li><li><b>mmap</b>: map a file into memory; reads become page faults; shared between processes → the basis of shared libraries and some DBs.</li></ul>
+
+<h2>Signals <span class="badge basic">basics</span></h2>
+<table><tr><th>Signal</th><th>#</th><th>Default</th><th>Notes</th></tr>
+<tr><td>SIGHUP</td><td>1</td><td>terminate</td><td>Terminal hangup; daemons repurpose it to <b>reload config</b> (nginx, sshd)</td></tr>
+<tr><td>SIGINT</td><td>2</td><td>terminate</td><td>Ctrl-C</td></tr>
+<tr><td>SIGQUIT</td><td>3</td><td>core dump</td><td>Ctrl-\; JVM prints thread dump</td></tr>
+<tr><td>SIGKILL</td><td>9</td><td>terminate</td><td><b>Cannot be caught, blocked, or ignored.</b> No cleanup. Doesn't work on D-state or zombies.</td></tr>
+<tr><td>SIGSEGV</td><td>11</td><td>core dump</td><td>Invalid memory access</td></tr>
+<tr><td>SIGPIPE</td><td>13</td><td>terminate</td><td>Write to a pipe/socket with no reader — kills naive servers; usually ignored and handled via EPIPE</td></tr>
+<tr><td>SIGTERM</td><td>15</td><td>terminate</td><td>Polite request to exit; default for <code>kill</code>, docker stop, systemd stop. Handle it: finish requests, close cleanly. Then SIGKILL after a grace period.</td></tr>
+<tr><td>SIGCHLD</td><td>17</td><td>ignore</td><td>Child exited — parent should <code>wait()</code></td></tr>
+<tr><td>SIGSTOP/SIGCONT</td><td>19/18</td><td>stop/continue</td><td>SIGSTOP uncatchable. Ctrl-Z sends SIGTSTP (catchable)</td></tr>
+<tr><td>SIGUSR1/2</td><td>10/12</td><td>terminate</td><td>App-defined (log rotation, toggle debug)</td></tr></table>
+<p>Signals are delivered asynchronously when the process next returns to user mode; handlers run on the process's stack and should only call async-signal-safe functions (set a flag, write to a pipe — the "self-pipe trick"). <code>kill -l</code> lists them; exit code 128+N means killed by signal N (137 = SIGKILL, 139 = SIGSEGV, 143 = SIGTERM).</p>
+
+<h2>Inter-process communication (IPC) <span class="badge deep">deep dive</span></h2>
+<table><tr><th>Mechanism</th><th>How</th><th>Use</th></tr>
+<tr><td>Pipe <code>|</code></td><td>Unidirectional byte stream in kernel buffer (64 KB); related processes</td><td>Shell pipelines; writer blocks when full → backpressure for free</td></tr>
+<tr><td>Named pipe (FIFO)</td><td>Pipe with a filesystem name</td><td>Unrelated processes</td></tr>
+<tr><td>Unix domain socket</td><td>Socket API, local only, bidirectional, can pass FDs!</td><td>Docker daemon, systemd, DB clients (<code>/var/run/mysqld.sock</code>) — faster than TCP loopback</td></tr>
+<tr><td>TCP/UDP socket</td><td>Network stack</td><td>Any process anywhere</td></tr>
+<tr><td>Shared memory (<code>shm_open</code>/<code>mmap</code>)</td><td>Same physical pages in both address spaces</td><td>Fastest; needs synchronization (semaphores/futexes)</td></tr>
+<tr><td>Signals</td><td>Tiny async notifications</td><td>Control, not data</td></tr>
+<tr><td>Message queues, D-Bus</td><td>Structured messages</td><td>Desktop/system services</td></tr>
+<tr><td>eventfd / futex</td><td>Lightweight wake-ups</td><td>Building blocks of libraries</td></tr></table>
+
+<h2>I/O models: blocking, non-blocking, epoll, io_uring <span class="badge deep">deep dive</span></h2>
+<p>How does one server handle 100k connections (the "C10k" problem)?</p>
+<div class="tabs">
+<div class="tab" data-title="Blocking, thread-per-connection"><p><code>read()</code> blocks until data arrives. One thread per connection: simple, but 100k threads = 100k stacks (8 MB virtual each), heavy context switching. Apache prefork/worker, classic Java servlets.</p></div>
+<div class="tab" data-title="Non-blocking + readiness (select/poll/epoll)"><p>Set sockets <code>O_NONBLOCK</code>; ask the kernel "which of these FDs are ready?" <code>select</code>/<code>poll</code> are O(n) per call; <b><code>epoll</code></b> (Linux) registers interest once and returns only ready FDs in O(1) — scales to millions. One thread runs an <b>event loop</b>: wait → handle ready events (never block) → repeat. nginx, Node.js, Redis, HAProxy, Go's netpoller, Python asyncio all do this. Level-triggered vs edge-triggered modes. Multi-core: one event loop per core (nginx workers, SO_REUSEPORT).</p></div>
+<div class="tab" data-title="Async I/O (io_uring)"><p>Submit operations to a ring buffer shared with the kernel; kernel completes them asynchronously and posts completions — no syscall per operation, works for files too (epoll doesn't help with regular file reads, which always "block"). The modern high-performance path.</p></div>
+</div>
+<p><b>Zero-copy:</b> <code>sendfile()</code> moves file → socket inside the kernel (no user-space copy); Kafka and nginx use it for huge throughput.</p>
+
+<h2>Boot process: power on → login <span class="badge basic">basics</span></h2>
+<div class="steps">
+<div class="step"><b>Firmware (BIOS/UEFI):</b> POST, hardware init, finds the boot device, loads the bootloader (from MBR or the EFI System Partition).</div>
+<div class="step"><b>Bootloader (GRUB):</b> presents menu, loads the kernel image (<code>vmlinuz</code>) and <b>initramfs</b> into memory, passes kernel command line (<code>root=…</code>, <code>quiet</code>).</div>
+<div class="step"><b>Kernel:</b> decompresses, initializes CPUs, memory, drivers; mounts initramfs as a temporary root; runs its <code>/init</code> which loads modules needed for the real root (storage, LVM, crypto, network for PXE/NFS root), then <code>switch_root</code> to the real filesystem.</div>
+<div class="step"><b>PID 1 — systemd:</b> reads unit files, builds the dependency graph, reaches the default <b>target</b> (multi-user/graphical) by starting units in parallel: mounts (<code>/etc/fstab</code>), network, logging (journald), sshd, your services.</div>
+<div class="step"><b>Login:</b> getty on TTYs / display manager; sshd accepts connections; PAM authenticates; shell starts.</div>
+</div>
+<p>Debug boot: <code>dmesg</code> (kernel ring buffer), <code>journalctl -b</code>, <code>systemd-analyze blame</code>. Datacenter servers often <b>PXE boot</b>: NIC gets DHCP → TFTP downloads a bootloader → fetches kernel+initramfs over HTTP → installer or diskless image. Know this flow for "how would you provision 10k servers".</p>
+
+<h2>Containers: namespaces & cgroups <span class="badge deep">deep dive</span></h2>
+<p>A container is just a normal Linux process with a restricted view and limited resources — no hypervisor.</p>
+<div class="compare">
+<div class="card"><h4>Namespaces (isolation — what you can <i>see</i>)</h4><ul><li><b>pid</b>: own PID 1; can't see host processes</li><li><b>net</b>: own interfaces, routes, iptables; veth pair bridges to host</li><li><b>mnt</b>: own mount table / root filesystem (overlayfs image layers)</li><li><b>uts</b>: own hostname</li><li><b>ipc</b>, <b>user</b> (uid 0 inside = unprivileged outside), <b>cgroup</b>, <b>time</b></li></ul></div>
+<div class="card"><h4>cgroups (limits — what you can <i>use</i>)</h4><ul><li><b>cpu</b>: weight & quota (throttling)</li><li><b>memory</b>: limit → OOM inside the group</li><li><b>io</b>: bandwidth/IOPS limits</li><li><b>pids</b>: max processes (fork bomb protection)</li><li>Hierarchy under <code>/sys/fs/cgroup/</code>; systemd puts every service in its own cgroup — <code>systemd-cgtop</code></li></ul></div>
+</div>
+<p>Plus: <b>capabilities</b> (split root into ~40 privileges, e.g., CAP_NET_BIND_SERVICE), <b>seccomp</b> (syscall filter), <b>overlayfs</b> (copy-on-write layered image). VMs vs containers: VMs virtualize hardware (own kernel; stronger isolation; heavier); containers share the kernel (fast start, dense, kernel bug = shared risk). gVisor/Firecracker blend the two.</p>
+
+<h2>Self-test: OS rapid fire</h2>
+<div class="quiz">
+<div class="q"><b>What's the difference between a process and a thread, at the kernel level in Linux?</b><div class="ans">Both are tasks (task_struct) created with clone(). A thread is a task created with flags that share the address space (CLONE_VM), FDs (CLONE_FILES), signal handlers, etc. with its creator; a process gets copies (COW). Threads share a thread-group ID (the PID you see); each has its own TID, stack, registers.</div></div>
+<div class="q"><b>Load average is 30 on an 8-core box but CPU is 90% idle. What's going on?</b><div class="ans">Tasks in uninterruptible (D) sleep count toward load. Likely an I/O bottleneck: disk saturated, or a hung NFS mount. Check <code>vmstat 1</code> (b column, wa%), <code>iostat -x 1</code> (await, %util), <code>ps -eo pid,stat,wchan,cmd | awk '$2 ~ /D/'</code>.</div></div>
+<div class="q"><b>A disk is 100% full, you delete a 50 GB log, but df still says 100%. Why?</b><div class="ans">A process still holds the file open; unlink removed the name but the inode and blocks stay until the last FD closes. Find it with <code>lsof +L1</code>; truncate via <code>: > /proc/PID/fd/N</code> or restart/HUP the process. Prevention: logrotate with copytruncate or signal the app to reopen logs.</div></div>
+<div class="q"><b>Why can't you kill -9 a process?</b><div class="ans">Either it's in D state (uninterruptible I/O wait — the signal is delivered when the syscall returns, which may be never if the storage is hung) or it's a zombie (already dead; nothing to kill — reap by fixing/killing the parent). Also possible: PID 1 in a container ignores signals it has no handler for.</div></div>
+<div class="q"><b>What happens when a process calls malloc(1 GB) and never touches it?</b><div class="ans">glibc uses mmap for large allocations → the kernel just reserves virtual address range (VSZ grows); no physical pages are assigned (RSS unchanged) until pages are touched (minor faults). With overcommit, even allocating more than physical RAM succeeds.</div></div>
+<div class="q"><b>Explain copy-on-write and one system that relies on it.</b><div class="ans">After fork, parent and child share physical pages marked read-only; a write triggers a page fault and the kernel copies just that page. Redis BGSAVE forks and the child writes the snapshot while the parent keeps serving — memory only grows by the pages modified during the save.</div></div>
+<div class="q"><b>What is the difference between SIGTERM and SIGKILL, and how should a service handle shutdown?</b><div class="ans">SIGTERM is catchable: stop accepting new work, finish in-flight requests, flush, close, exit (graceful). SIGKILL is uncatchable, immediate — no cleanup; data in process memory is lost. Orchestrators send TERM, wait a grace period (30 s), then KILL.</div></div>
+<div class="q"><b>How does epoll let one thread serve 100k connections?</b><div class="ans">Sockets are non-blocking; the thread registers them with epoll once; epoll_wait returns only the FDs that are ready (O(ready), not O(n)). The event loop processes each ready socket without blocking and goes back to waiting; idle connections cost only memory, not threads.</div></div>
+<div class="q"><b>Memory in a container keeps hitting its limit though the app's heap is small. Why?</b><div class="ans">cgroup memory accounting includes page cache (file reads/writes by the container) and kernel memory, not just anonymous RSS. Check memory.stat (file vs anon). Cache is reclaimable so it rarely causes OOM, but it inflates usage graphs; if OOM does happen, it's anon memory — look for leaks or set a realistic limit.</div></div>
+</div>
+
+<div class="footer-nav"><a href="case-studies.html">← Case Studies</a><a href="linux.html">Next: Linux & Troubleshooting →</a></div>
+</main></div>
+<script src="app.js"></script></body></html>

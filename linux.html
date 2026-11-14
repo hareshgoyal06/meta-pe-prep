@@ -1,0 +1,221 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Linux & Troubleshooting — PE Prep</title><link rel="stylesheet" href="styles.css"></head><body>
+<div class="layout"><aside class="sidebar"></aside>
+<main>
+<section class="hero"><h1>Linux & Production Troubleshooting</h1><p class="lead">The PE's daily craft. Interviewers hand you a scenario ("the site is slow", "disk is full", "a host won't boot") and watch how you think. The winning pattern is always the same: <b>observe → hypothesize → test → narrow down → fix → prevent</b>, naming the exact tools and what each number means.</p></section>
+
+<div class="callout pe"><b>The 60-second triage (memorize; say it out loud in interviews)</b>
+<pre><code>uptime                    # load averages: trend? (1 vs 5 vs 15 min)
+dmesg -T | tail           # kernel errors: OOM kills, disk errors, NIC resets
+vmstat 1 5                # r (runnable), b (blocked), si/so (swap), us/sy/id/wa (CPU breakdown), cs
+mpstat -P ALL 1           # per-CPU: one core pegged? (single-threaded bottleneck / IRQ)
+pidstat 1                 # per-process CPU
+iostat -xz 1              # per-disk: r/s w/s, await (latency), %util, avgqu-sz
+free -m                   # memory: available, swap used, buff/cache
+sar -n DEV 1              # NIC throughput, errors/drops
+sar -n TCP,ETCP 1         # new connections/s, retransmits (network trouble!)
+top / htop                # the overview; sort by CPU, MEM</code></pre>
+(Brendan Gregg's "Linux Performance Analysis in 60,000 Milliseconds" — the Netflix checklist.)</div>
+
+<h2>The toolbox by resource <span class="badge basic">basics</span></h2>
+<div class="tabs">
+<div class="tab" data-title="CPU"><table><tr><th>Tool</th><th>Shows</th><th>Read it</th></tr>
+<tr><td><code>top</code>/<code>htop</code></td><td>Per-process %CPU, load, per-core bars</td><td><code>us</code> user, <code>sy</code> kernel (high = syscall heavy, networking), <code>wa</code> I/O wait, <code>st</code> steal (VM neighbor stealing CPU!), <code>si</code> softirq (network interrupts)</td></tr>
+<tr><td><code>mpstat -P ALL 1</code></td><td>Per-CPU utilization</td><td>One core at 100%, others idle → single-threaded app or IRQ affinity problem</td></tr>
+<tr><td><code>pidstat 1</code></td><td>Per-process CPU over time</td><td>Who is burning</td></tr>
+<tr><td><code>perf top</code> / <code>perf record -g</code></td><td>Which functions (kernel+user) consume CPU; flame graphs</td><td>Deep profiling</td></tr>
+<tr><td><code>cat /proc/pressure/cpu</code></td><td>PSI: % of time tasks stalled waiting for CPU</td><td>Modern saturation signal</td></tr>
+<tr><td><code>nproc</code>, <code>lscpu</code></td><td>Core count, NUMA</td><td>Context for load average</td></tr></table></div>
+<div class="tab" data-title="Memory"><table><tr><th>Tool</th><th>Shows</th></tr>
+<tr><td><code>free -m</code></td><td>Total/used/available, swap, cache. Look at <b>available</b>, not free.</td></tr>
+<tr><td><code>vmstat 1</code></td><td><code>si/so</code> swap in/out per second — non-zero sustained = thrashing. <code>free</code>, <code>buff</code>, <code>cache</code>.</td></tr>
+<tr><td><code>top</code> (sort M), <code>ps aux --sort=-rss</code></td><td>RSS per process; biggest consumers</td></tr>
+<tr><td><code>smem</code>, <code>/proc/PID/smaps_rollup</code></td><td>PSS/USS — true per-process usage with shared libs split fairly</td></tr>
+<tr><td><code>dmesg | grep -i oom</code></td><td>OOM kills with scores and RSS at kill time</td></tr>
+<tr><td><code>/proc/meminfo</code></td><td>Everything: Slab (kernel objects — can leak!), Dirty, Shmem, HugePages</td></tr>
+<tr><td><code>slabtop</code></td><td>Kernel slab caches (dentry/inode explosion from millions of files)</td></tr>
+<tr><td><code>cat /proc/pressure/memory</code></td><td>PSI memory stall</td></tr></table></div>
+<div class="tab" data-title="Disk / I/O"><table><tr><th>Tool</th><th>Shows</th></tr>
+<tr><td><code>df -h</code> / <code>df -i</code></td><td>Space / <b>inodes</b> per filesystem</td></tr>
+<tr><td><code>du -xsh /* 2>/dev/null | sort -h</code></td><td>Where the space went (−x stays on one FS)</td></tr>
+<tr><td><code>iostat -xz 1</code></td><td><code>r/s w/s</code> IOPS, <code>rkB/s wkB/s</code>, <b><code>await</code></b> (ms per I/O — SSD should be &lt;1 ms, HDD ~10 ms), <code>avgqu-sz</code> queue depth, <code>%util</code> (100% = saturated for HDD; misleading for SSD/RAID)</td></tr>
+<tr><td><code>iotop</code> / <code>pidstat -d 1</code></td><td>Which process does the I/O</td></tr>
+<tr><td><code>lsof +L1</code>, <code>lsof -p PID</code></td><td>Deleted-but-open files; what a process has open</td></tr>
+<tr><td><code>lsblk</code>, <code>blkid</code>, <code>mount</code>, <code>findmnt</code></td><td>Block devices, filesystems, mount options (ro? noatime?)</td></tr>
+<tr><td><code>smartctl -a /dev/sda</code></td><td>Disk health (reallocated sectors, pending sectors)</td></tr>
+<tr><td><code>dmesg</code></td><td>I/O errors, filesystem remounted read-only (ext4 on error)</td></tr>
+<tr><td><code>fstrim</code>, <code>xfs_info</code>, <code>tune2fs -l</code></td><td>FS details</td></tr></table></div>
+<div class="tab" data-title="Network"><table><tr><th>Tool</th><th>Shows</th></tr>
+<tr><td><code>ip addr</code> / <code>ip link</code> / <code>ip route</code> / <code>ip neigh</code></td><td>Interfaces & IPs, link state, routing table, ARP cache (replaces ifconfig/route/arp)</td></tr>
+<tr><td><code>ss -tulpn</code></td><td>Listening sockets with process. <code>ss -tan state established</code>, <code>ss -s</code> summary (TIME_WAIT counts!). Replaces netstat.</td></tr>
+<tr><td><code>ping</code>, <code>mtr</code>/<code>traceroute</code></td><td>Reachability & latency; per-hop loss (mtr is traceroute+ping continuous)</td></tr>
+<tr><td><code>dig +trace example.com</code>, <code>dig @8.8.8.8 A example.com</code>, <code>resolvectl</code></td><td>DNS step-by-step; test specific server; local resolver state</td></tr>
+<tr><td><code>curl -v -w "@fmt"</code>, <code>curl -sS -o /dev/null -w "%{time_connect} %{time_starttransfer} %{http_code}"</code></td><td>HTTP from the client's view with timing breakdown (DNS, connect, TLS, TTFB)</td></tr>
+<tr><td><code>tcpdump -i eth0 -nn port 443 -w cap.pcap</code></td><td>Packet capture; read with Wireshark. See retransmits, RSTs, handshake failures</td></tr>
+<tr><td><code>sar -n DEV 1</code>, <code>ethtool -S eth0</code>, <code>ip -s link</code></td><td>Throughput, errors, drops, ring buffer overruns</td></tr>
+<tr><td><code>sar -n TCP,ETCP 1</code>, <code>nstat</code>, <code>netstat -s</code></td><td>Retransmits (retrans/s), resets, listen overflows (SYN backlog full!)</td></tr>
+<tr><td><code>iptables -L -n -v</code> / <code>nft list ruleset</code></td><td>Firewall rules & packet counters</td></tr>
+<tr><td><code>nc -zv host 443</code>, <code>openssl s_client -connect host:443</code></td><td>Port open? TLS handshake & certificate details</td></tr>
+<tr><td><code>conntrack -L</code>, <code>sysctl net.netfilter.nf_conntrack_max</code></td><td>Connection tracking table full = dropped new connections</td></tr></table></div>
+<div class="tab" data-title="Processes & tracing"><table><tr><th>Tool</th><th>Shows</th></tr>
+<tr><td><code>ps -eo pid,ppid,stat,wchan:20,etime,cmd --sort=-%cpu</code></td><td>State, what it's waiting on (wchan), age</td></tr>
+<tr><td><code>pstree -p</code></td><td>Parent/child tree (zombies' parents)</td></tr>
+<tr><td><code>strace -f -tt -T -p PID</code> / <code>strace -c</code></td><td>Every syscall with timestamps & durations / summary counts. "Where is it stuck?" (<b>slows the target</b> — careful in prod)</td></tr>
+<tr><td><code>ltrace</code></td><td>Library calls</td></tr>
+<tr><td><code>lsof -p PID</code>, <code>ls -l /proc/PID/fd</code></td><td>Open files/sockets; FD count vs limit (<code>/proc/PID/limits</code>)</td></tr>
+<tr><td><code>/proc/PID/status</code>, <code>/proc/PID/stack</code>, <code>/proc/PID/wchan</code></td><td>Threads, VmRSS, kernel stack (why it's in D)</td></tr>
+<tr><td><code>gdb -p PID</code> → <code>thread apply all bt</code>, <code>pstack</code>, <code>py-spy dump</code>, <code>jstack</code></td><td>User-space stacks (what is it doing / deadlock)</td></tr>
+<tr><td><code>perf trace</code>, <code>bpftrace</code>, BCC tools (<code>execsnoop</code>, <code>opensnoop</code>, <code>biolatency</code>, <code>tcpconnect</code>)</td><td>eBPF: low-overhead production tracing</td></tr>
+<tr><td><code>systemctl status X</code>, <code>journalctl -u X -f --since "1h ago"</code></td><td>Service state & logs</td></tr>
+<tr><td><code>ulimit -a</code>, <code>cat /proc/sys/fs/file-nr</code></td><td>Limits</td></tr></table></div>
+</div>
+
+<h2>/proc and /sys: the kernel's window <span class="badge deep">deep dive</span></h2>
+<p>Virtual filesystems — reading a file calls a kernel function. Every tool above is a prettier view of these.</p>
+<table><tr><th>Path</th><th>Contents</th></tr>
+<tr><td><code>/proc/loadavg</code></td><td>1/5/15 load, running/total tasks, last PID</td></tr>
+<tr><td><code>/proc/cpuinfo</code>, <code>/proc/meminfo</code>, <code>/proc/stat</code></td><td>Hardware; memory breakdown; cumulative CPU jiffies & context switches (what top diffs)</td></tr>
+<tr><td><code>/proc/PID/{cmdline,environ,cwd,exe,fd/,maps,status,stat,io,limits,oom_score,cgroup,ns/}</code></td><td>Everything about a process. <code>maps</code> = memory map; <code>io</code> = bytes read/written; <code>ns</code> = namespaces (containers)</td></tr>
+<tr><td><code>/proc/net/{tcp,udp,dev,snmp,sockstat}</code></td><td>Raw socket tables and counters</td></tr>
+<tr><td><code>/proc/sys/</code> (= <code>sysctl</code>)</td><td>Tunables: <code>net.core.somaxconn</code>, <code>net.ipv4.tcp_tw_reuse</code>, <code>net.ipv4.ip_local_port_range</code>, <code>vm.swappiness</code>, <code>vm.dirty_ratio</code>, <code>fs.file-max</code>, <code>kernel.pid_max</code></td></tr>
+<tr><td><code>/proc/pressure/{cpu,memory,io}</code></td><td>PSI — the best modern saturation metrics</td></tr>
+<tr><td><code>/sys/class/net/eth0/</code>, <code>/sys/block/sda/queue/</code>, <code>/sys/fs/cgroup/</code></td><td>Device attributes, I/O scheduler, cgroup limits & stats</td></tr>
+<tr><td><code>/dev/</code></td><td>Device nodes (udev-managed): <code>sda</code>, <code>nvme0n1</code>, <code>null</code>, <code>zero</code>, <code>urandom</code>, <code>pts/</code></td></tr></table>
+
+<h2>systemd essentials <span class="badge basic">basics</span></h2>
+<pre><code>systemctl status nginx          # active? since when? recent log lines, cgroup processes
+systemctl start|stop|restart|reload nginx
+systemctl enable --now nginx    # start at boot + now
+systemctl list-units --failed
+systemctl cat nginx             # show the unit file (and drop-ins)
+systemctl edit nginx            # override via /etc/systemd/system/nginx.service.d/override.conf
+systemctl daemon-reload         # after editing units
+journalctl -u nginx -f          # follow logs; -b this boot; -p err; --since "10 min ago"; -o json
+systemd-analyze blame           # boot time per unit
+systemd-cgtop                   # resource usage per service cgroup</code></pre>
+<pre><code>[Unit]
+Description=My API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/myapi --port 8080
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+MemoryMax=2G
+User=myapi
+Environment=ENV=prod
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+<p>Unit types: service, socket (activation), timer (cron replacement), mount, target (grouping). Dependencies: <code>Requires</code>/<code>Wants</code> (hard/soft) vs <code>After</code>/<code>Before</code> (ordering only — a classic confusion).</p>
+
+<h2>Shell & text processing for ops <span class="badge basic">basics</span></h2>
+<p>Meta PE coding rounds are often "practical Python/bash": parse a log, aggregate, find top-N. Be fluent.</p>
+<pre><code># top 10 IPs by request count in an access log
+awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -10
+
+# 5xx per minute
+grep ' 5[0-9][0-9] ' access.log | awk '{print substr($4,2,17)}' | uniq -c
+
+# p99 latency from a column (field 10, ms)
+awk '{print $10}' access.log | sort -n | awk '{a[NR]=$1} END{print a[int(NR*0.99)]}'
+
+# find files >1G modified in last day; largest dirs
+find / -xdev -type f -size +1G -mtime -1 -exec ls -lh {} \;
+du -xh --max-depth=2 / 2>/dev/null | sort -rh | head
+
+# processes in D state and what they wait on
+ps -eo pid,stat,wchan:30,cmd | awk '$2 ~ /^D/'
+
+# which process listens on 8080
+ss -tlnp 'sport = :8080'
+
+# watch something change
+watch -n1 'ss -s; cat /proc/loadavg'
+
+# safe log tail with context
+journalctl -u app --since "-15m" | grep -iE 'error|exception' -A3 | less
+
+# replace in-place across files, with backup
+sed -i.bak 's/old-host/new-host/g' /etc/app/*.conf
+
+# xargs parallel over hosts
+cat hosts | xargs -P 20 -I{} ssh -o ConnectTimeout=3 {} 'uptime'</code></pre>
+<p>Know: pipes & redirection (<code>2>&1</code>, <code>&>/dev/null</code>, <code>tee</code>), exit codes (<code>$?</code>, <code>set -euo pipefail</code>), <code>$()</code>, loops, <code>trap</code>, <code>cut</code>/<code>tr</code>/<code>sort</code>/<code>uniq</code>/<code>wc</code>/<code>xargs</code>/<code>awk</code>/<code>sed</code>/<code>grep -E</code>, <code>jq</code> for JSON, <code>ssh -L/-R/-J</code> tunnels, <code>rsync</code>, <code>screen</code>/<code>tmux</code>, <code>nohup</code>.</p>
+
+<h2>Incident scenarios, worked end to end <span class="badge pe">PE core</span></h2>
+<p>For each: say what you'd check first, what each result would imply, and how you'd prevent recurrence. Practice narrating.</p>
+
+<details class="reveal"><summary>1. "The website is slow." (the open-ended classic)</summary>
+<div class="steps">
+<div class="step"><b>Scope it:</b> Slow for everyone or some users/regions? All pages or one endpoint? Since when — correlate with deploys/config changes (most incidents are change-induced). Check dashboards: latency p50/p99, error rate, traffic. Is it slow or <i>erroring</i>?</div>
+<div class="step"><b>Follow the request path, outside-in:</b> DNS (dig timing), TLS/connect time (<code>curl -w</code>), LB health (backends up? uneven?), app servers (CPU? threads blocked?), downstream (DB latency, cache hit ratio, queue lag), network (retransmits, packet loss via mtr).</div>
+<div class="step"><b>On a slow host:</b> 60-second triage. High <code>us</code> → app CPU (profile with perf/py-spy). High <code>sy</code>/<code>si</code> → kernel/network. High <code>wa</code> + <code>await</code> → disk. <code>st</code> → noisy VM neighbor. Swap in/out → memory pressure. Many threads in D → I/O/NFS. Connection pile-up in <code>ss</code> (SYN-RECV, CLOSE-WAIT = app not closing) → backlog/app bug.</div>
+<div class="step"><b>Common root causes:</b> cache hit ratio dropped (cache restart / key change) → DB overloaded; slow query after data growth (missing index); GC pauses; connection pool exhaustion; a retry storm; a dependency's latency without timeouts; disk filling → fsync latency; cert/DNS misconfig causing retries.</div>
+<div class="step"><b>Mitigate:</b> rollback, scale out, shed load, failover, turn off the feature. Then root-cause, postmortem, add alert on the leading indicator you were missing.</div></div></details>
+
+<details class="reveal"><summary>2. "Disk is full on a production host."</summary>
+<p><code>df -h</code> (which FS?) → <code>df -i</code> (inodes?) → <code>du -xsh /* | sort -h</code> drilling down → usual suspects: <code>/var/log</code> (unrotated logs, journald — <code>journalctl --disk-usage</code>, <code>--vacuum-size</code>), <code>/tmp</code>, core dumps, docker images/volumes (<code>docker system df</code>), package caches, database binlogs. If <code>du</code> ≪ <code>df</code>: deleted-but-open files → <code>lsof +L1</code> → truncate via <code>/proc/PID/fd/N</code> (don't just delete). Also: a filesystem mounted <i>over</i> a directory that had data. <b>Immediate relief:</b> truncate (not rm) the biggest log, compress, move. <b>Prevent:</b> logrotate (size-based + compress + copytruncate or reopen signal), disk alerts at 80% with trend ("full in 6h"), separate partitions for /var/log and data, quotas, reserved blocks (ext4 5% root reserve).</p></details>
+
+<details class="reveal"><summary>3. "A service keeps getting OOM-killed."</summary>
+<p><code>dmesg -T | grep -i -A5 oom</code> → which process, its RSS, cgroup limit. Is it a leak (RSS climbs steadily → heap profiling, check for unbounded caches/queues), a legit need (limit too low; set via systemd <code>MemoryMax</code>/k8s resources), a burst (large batch job), or page cache accounting in the cgroup? Check <code>memory.stat</code> anon vs file. Look at <code>Slab</code> in meminfo (kernel memory leak — dentry explosion from tmp files). Mitigate: restart (buys time), raise limit, enable swap for soft landing, reduce workers. Prevent: alert on RSS trend, set <code>oom_score_adj</code> so the right thing dies (protect sshd/agents), load test memory.</p></details>
+
+<details class="reveal"><summary>4. "Load average is 200 on a 32-core box."</summary>
+<p>Is it CPU (R) or I/O (D)? <code>vmstat 1</code>: high <code>r</code> + low idle → CPU; high <code>b</code> + high <code>wa</code> → I/O. <code>ps -eo stat,cmd | sort | uniq -c</code> counts states. CPU: <code>top</code> → a fork bomb/runaway script? Too many worker processes configured (e.g., 500 PHP-FPM workers)? Steal time? I/O: <code>iostat -x</code> → which disk; <code>iotop</code> → who; a hung NFS mount (<code>mount</code>, <code>dmesg: nfs: server not responding</code>) makes every process touching it D-state forever. Fix NFS: <code>umount -f -l</code>, use <code>soft,intr</code> mounts for non-critical data.</p></details>
+
+<details class="reveal"><summary>5. "Can't SSH into a host."</summary>
+<p>Layered: ping (ICMP may be blocked — not conclusive) → <code>nc -zv host 22</code> (TCP open?) → if refused: sshd down / wrong port; if timeout: network/firewall/host down → check from another host in the same subnet (is it the host or the path?), console/BMC/IPMI access → on console: is it booted? disk full (sshd can't write)? OOM? Auth failing (<code>ssh -vvv</code>, <code>journalctl -u sshd</code>): keys, permissions on ~/.ssh (700/600), /etc/hosts.deny, PAM, LDAP down, home dir on hung NFS (login hangs!), max sessions. Fleet-wide: config push broke sshd_config (→ <code>sshd -t</code> validation in CI), firewall rule, DNS. Prevent: out-of-band console, canary config changes, never restart sshd without <code>sshd -t</code> and a second session open.</p></details>
+
+<details class="reveal"><summary>6. "Half the requests to a service fail with connection timeouts."</summary>
+<p>"Half" smells like one of two backends (or one of two LB nodes / one AZ) is bad. Check LB backend health; hit each backend directly with curl. On the bad one: is it listening (<code>ss -tlnp</code>)? SYN backlog overflow (<code>nstat | grep ListenOverflows</code> → raise <code>somaxconn</code> + app backlog, or app is too slow to accept)? conntrack table full (<code>dmesg: nf_conntrack: table full, dropping packet</code>)? Ephemeral port exhaustion on a client/proxy (many TIME_WAIT — <code>ss -s</code>; fix: keep-alive/connection pooling, <code>tcp_tw_reuse</code>, widen <code>ip_local_port_range</code>)? Half-open firewall/asymmetric routing (tcpdump: SYNs arriving, SYN-ACKs not returning)? DNS returning a dead IP (check all A records)? MTU/blackhole (small requests work, large fail — <code>ping -M do -s 1472</code>).</p></details>
+
+<details class="reveal"><summary>7. "DNS resolution is intermittently failing."</summary>
+<p><code>dig</code> against each configured resolver (<code>/etc/resolv.conf</code>, or <code>resolvectl status</code>); compare authoritative (<code>dig +trace</code> / <code>dig @ns1</code>). UDP packet loss → truncation/retries (check 5 s timeouts in app logs = resolver timeout). Resolver overloaded or rate-limiting; conntrack full on the resolver; negative caching of a transient failure; TTL too low → QPS storm; one bad resolver in the list (glibc tries in order, first one timing out adds 5 s to everything). Mitigate: local caching resolver (systemd-resolved/dnsmasq/unbound) on every host, multiple resolvers, <code>options timeout:1 attempts:2 rotate</code>, app-level DNS caching with sane TTL respect. Note: Java caches DNS forever by default — a notorious problem on failover.</p></details>
+
+<details class="reveal"><summary>8. "Deploy went out and error rate spiked to 30%."</summary>
+<p>Roll back first — don't debug in prod with users bleeding. Then: diff the deploy (code, config, dependency versions, schema). Errors in logs (stack traces), new exceptions, changed timeouts, environment variable missing, incompatible API between new and old instances during the rollout (mixed versions), cold caches/JIT warmup under full traffic, a migration locking a table. Prevent: canary with automated analysis, staged rollout, backward-compatible changes, feature flags, pre-prod load test, deploy during low traffic with someone watching.</p></details>
+
+<details class="reveal"><summary>9. "A host won't boot."</summary>
+<p>Console (IPMI/serial). Where does it stop? POST/firmware (hardware: RAM, disk missing) → bootloader (GRUB rescue: wrong root UUID after disk swap, corrupt /boot) → kernel panic (bad kernel update, missing initramfs driver, <code>fsck</code> required, root FS corruption) → systemd emergency mode (fstab entry for a missing disk — use <code>nofail</code>; failed mount) → network (DHCP/PXE). Boot an older kernel from GRUB; <code>rd.break</code>/rescue initramfs; chroot from live media. In a datacenter: automated remediation — reimage via PXE if the host doesn't come back in N minutes; hardware ticket if POST fails. A PE answer should mention <b>fleet automation</b> not just manual repair.</p></details>
+
+<details class="reveal"><summary>10. "A process is using 100% CPU and not responding."</summary>
+<p><code>top -H -p PID</code> (which thread?) → <code>perf top -p PID</code> or <code>py-spy top</code>/<code>jstack</code>/<code>gdb -p</code> → stack shows a spin loop, a lock convoy, GC storm, regex backtracking, infinite retry loop. <code>strace -p</code> showing no syscalls = pure user-space compute (or spinlock); a flood of <code>futex</code> = lock contention; <code>EAGAIN</code> loop = broken event-loop logic. Decide: kill and restart (capture a core/dump first for postmortem: <code>gcore</code>), or isolate it with <code>renice</code>/cgroup until you can debug.</p></details>
+
+<details class="reveal"><summary>11. "Clock drift broke things." (certs invalid, Kerberos failing, logs out of order)</summary>
+<p><code>timedatectl</code>, <code>chronyc tracking/sources</code> — is NTP synced? Large offsets, a VM paused and resumed, NTP server unreachable (firewall UDP 123). TLS fails "certificate not yet valid"; Kerberos 5-min skew; distributed systems with LWW lose data. Fix NTP; for big steps restart time-sensitive services. Prevent: monitor offset, multiple NTP sources, chrony makestep on boot.</p></details>
+
+<details class="reveal"><summary>12. "Filesystem went read-only."</summary>
+<p>ext4/XFS remount read-only on I/O errors to protect data. <code>dmesg</code>: <code>EXT4-fs error … Remounting filesystem read-only</code>, SCSI/NVMe errors, <code>smartctl</code> for failing disk. Writes fail with EROFS everywhere (logs, DB!). Action: fail over the service off this host, back up what you can, <code>fsck</code> unmounted, replace the disk. Fleet: automated drain + repair workflow triggered by dmesg patterns.</p></details>
+
+<h2>Performance methodology <span class="badge deep">deep dive</span></h2>
+<ul><li><b>USE</b> per resource (CPU, memory, disk, NIC, locks): Utilization, Saturation (queue/wait), Errors. Saturation precedes failure.</li><li><b>Latency breakdown:</b> where does the time go? Trace one slow request end to end before optimizing anything.</li><li><b>Amdahl's law:</b> speeding up a part that's 10% of the time gives ≤ 10%. Measure first.</li><li><b>Little's law:</b> concurrency = throughput × latency. 1000 RPS × 0.2 s = 200 in-flight → that's your thread/connection pool size. Queue depth explodes as utilization → 100% (queuing theory: wait time ∝ 1/(1−ρ)) — why running at 90% utilization hurts p99.</li><li><b>Flame graphs</b> (perf → stackcollapse → flamegraph.pl): see where CPU goes across the whole stack.</li><li><b>Observer effect:</b> strace can slow a process 10–100×; prefer perf/eBPF in production.</li><li><b>Tail latency:</b> p99 is dominated by rare events — GC, compaction, page faults, context switches, network retransmits (200 ms RTO minimum!), hedged requests fix it from the client side.</li></ul>
+
+<h2>Key kernel tunables PEs touch</h2>
+<table><tr><th>sysctl</th><th>Why</th></tr>
+<tr><td><code>net.core.somaxconn</code>, <code>net.ipv4.tcp_max_syn_backlog</code></td><td>Accept/SYN queue sizes for busy servers (default 4096/128 historically)</td></tr>
+<tr><td><code>net.ipv4.ip_local_port_range</code>, <code>net.ipv4.tcp_tw_reuse</code></td><td>Clients/proxies making many outbound connections (port exhaustion)</td></tr>
+<tr><td><code>net.ipv4.tcp_fin_timeout</code>, <code>tcp_keepalive_time</code></td><td>Dead connection cleanup</td></tr>
+<tr><td><code>net.core.rmem_max/wmem_max</code>, <code>tcp_rmem/tcp_wmem</code></td><td>Socket buffers for high bandwidth-delay-product links</td></tr>
+<tr><td><code>net.netfilter.nf_conntrack_max</code></td><td>Connection tracking table (NAT/firewall hosts, Kubernetes nodes)</td></tr>
+<tr><td><code>fs.file-max</code>, <code>fs.nr_open</code>, ulimit <code>nofile</code></td><td>FD limits</td></tr>
+<tr><td><code>vm.swappiness</code>, <code>vm.dirty_ratio</code>, <code>vm.dirty_background_ratio</code></td><td>Swap preference; how much dirty page cache before writeback blocks writers (latency spikes)</td></tr>
+<tr><td><code>vm.overcommit_memory</code>, <code>vm.max_map_count</code></td><td>Redis/Elasticsearch requirements</td></tr>
+<tr><td><code>kernel.pid_max</code>, <code>kernel.threads-max</code></td><td>Huge thread counts</td></tr></table>
+
+<h2>Self-test: Linux rapid fire</h2>
+<div class="quiz">
+<div class="q"><b>What does <code>%wa</code> in top mean, and is high wa always bad?</b><div class="ans">Time CPUs were idle while at least one I/O was outstanding. It indicates I/O-bound workload; it's "wasted" CPU but may be normal for a storage server. Correlate with iostat await — high await = disk latency problem; high wa with low await = just lots of I/O.</div></div>
+<div class="q"><b>Difference between <code>Requires=</code> and <code>After=</code> in systemd?</b><div class="ans">Requires is a dependency (if B fails to start, A fails/stops); After is ordering only (A starts after B has started). You usually want both: Requires=B After=B. Wants is a soft dependency.</div></div>
+<div class="q"><b>You see thousands of sockets in CLOSE_WAIT. What does that mean?</b><div class="ans">The remote side closed (sent FIN) and we ACKed, but our application hasn't called close() on the socket — an application bug (leaking connections). TIME_WAIT, by contrast, is normal on the side that closed first and clears after 2×MSL (60 s).</div></div>
+<div class="q"><b>How do you find which process is writing heavily to disk?</b><div class="ans"><code>iotop -o</code> or <code>pidstat -d 1</code>; confirm with <code>/proc/PID/io</code> (write_bytes) and <code>lsof -p PID</code> to see which files. BCC <code>biosnoop</code> for per-I/O detail.</div></div>
+<div class="q"><b>What is an inode, and how can a disk be "full" with free space?</b><div class="ans">Inode = metadata structure for a file (permissions, timestamps, block pointers); fixed number created at mkfs. Millions of tiny files (mail spools, session files, cache dirs) exhaust inodes while bytes remain: <code>df -i</code> shows 100% IUse. Fix: delete the small files; long-term use a FS with dynamic inodes (XFS/btrfs) or pack small files.</div></div>
+<div class="q"><b>Walk me through what strace would show for <code>cat file.txt</code>.</b><div class="ans">execve("/bin/cat"), brk/mmap for loader & libc, openat(AT_FDCWD, "file.txt", O_RDONLY) = 3, fstat(3), read(3, buf, 131072) = N, write(1, buf, N), read(3) = 0, close(3), close(1), exit_group(0).</div></div>
+<div class="q"><b>How do hard links differ from symlinks in failure behavior?</b><div class="ans">Hard link: same inode, same filesystem only, can't link directories; deleting one name doesn't affect the other. Symlink: separate inode holding a path; can cross filesystems and point to directories; dangles if the target is removed; permissions are the target's.</div></div>
+<div class="q"><b>What's the first thing you do when paged for a major outage?</b><div class="ans">Acknowledge, check what changed recently (deploys/config/infra), assess impact & scope, start/join the incident channel, and focus on <i>mitigation</i> (rollback/failover/shed) before root cause. Communicate status at intervals. Debug after users are OK.</div></div>
+</div>
+
+<div class="footer-nav"><a href="os.html">← Operating Systems</a><a href="networking.html">Next: Networking →</a></div>
+</main></div>
+<script src="app.js"></script></body></html>
